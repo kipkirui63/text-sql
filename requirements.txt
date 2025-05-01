@@ -1,7 +1,7 @@
 streamlit
 pandas
 openpyxl
-python-dotenv
+python-dotenv         
 langchain
 langchain-openai
 langchain-community
