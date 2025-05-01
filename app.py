@@ -1,14 +1,11 @@
 import os
 import sqlite3
 import pandas as pd
-from dotenv import load_dotenv
 import streamlit as st
 from langchain_openai import ChatOpenAI
 from langchain_community.utilities.sql_database import SQLDatabase
 from langchain_experimental.sql import SQLDatabaseChain
 
-# Load environment variables
-load_dotenv()
 
 # App UI setup
 st.set_page_config(page_title="Text-to-SQL Agent", layout="wide")
