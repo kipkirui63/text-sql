@@ -2,13 +2,14 @@ import os
 import sqlite3
 import pandas as pd
 import streamlit as st
+from langchain.prompts import PromptTemplate
 from langchain_openai import ChatOpenAI
+from langchain.chains import LLMChain
 from langchain_community.utilities.sql_database import SQLDatabase
-from langchain_experimental.sql import SQLDatabaseChain
 
 # Setup
-st.set_page_config(page_title="Text-to-SQL Agent", layout="wide")
-st.title("🧠 Text-to-SQL Agent with Full Features")
+st.set_page_config(page_title="Text-to-SQL with Schema Prompt", layout="wide")
+st.title("🧠 Text-to-SQL Agent (with Schema & Autohint)")
 
 DB_PATH = "my_database.db"
 if "query_history" not in st.session_state:
@@ -16,6 +17,32 @@ if "query_history" not in st.session_state:
 
 def connect_to_db():
     return SQLDatabase.from_uri(f"sqlite:///{DB_PATH}")
+
+def get_all_schemas(db) -> str:
+    schema_str = ""
+    for table in db.get_usable_table_names():
+        try:
+            columns = db.run(f"PRAGMA table_info({table})")
+            col_lines = [f"{col['name']} ({col['type']})" for col in columns]
+            schema_str += f"Table: {table}\nColumns: {', '.join(col_lines)}\n\n"
+        except:
+            continue
+    return schema_str.strip()
+
+def format_schema_as_text(db) -> str:
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        tables = pd.read_sql_query("SELECT name FROM sqlite_master WHERE type='table';", conn)["name"]
+        output = ""
+        for table in tables:
+            df = pd.read_sql_query(f"PRAGMA table_info({table});", conn)
+            output += f"📄 **{table}**\n"
+            for i, row in df.iterrows():
+                output += f"- `{row['name']}` ({row['type']})\n"
+            output += "\n"
+        return output
+    except:
+        return ""
 
 def add_file_to_db(uploaded_file):
     file_name = uploaded_file.name
@@ -49,32 +76,24 @@ with st.expander("📂 Upload CSV or Excel to add new tables"):
     if uploaded_file:
         add_file_to_db(uploaded_file)
 
-# Connect to DB
+# DB and schema context
 db = connect_to_db()
+schema_text = get_all_schemas(db)
+schema_display = format_schema_as_text(db)
 
-# ========================
-# Sidebar: Table Preview, Schema, History
-# ========================
+# Sidebar: preview + history
 with st.sidebar:
     st.header("📊 Table Preview")
     try:
         tables = db.get_usable_table_names()
-        selected_table = st.selectbox("Select a table", sorted(tables))
+        selected_table = st.selectbox("Preview table", sorted(tables))
         if selected_table:
             conn = sqlite3.connect(DB_PATH)
             preview_df = pd.read_sql_query(f"SELECT * FROM {selected_table} LIMIT 5;", conn)
-            st.markdown(f"**Preview of `{selected_table}` (first 5 rows):**")
             st.dataframe(preview_df)
-
-            # Schema viewer
-            st.markdown(f"**Schema of `{selected_table}`:**")
-            cursor = conn.execute(f"PRAGMA table_info({selected_table});")
-            schema = pd.DataFrame(cursor.fetchall(), columns=["cid", "name", "type", "notnull", "default", "pk"])
-            st.dataframe(schema[["name", "type"]])
     except Exception as e:
-        st.warning(f"⚠️ Error loading tables: {e}")
+        st.warning(f"⚠️ Table preview failed: {e}")
 
-    # Query history
     st.markdown("---")
     st.header("🕓 Query History")
     if st.session_state.query_history:
@@ -84,30 +103,46 @@ with st.sidebar:
             st.session_state.query_history = []
             st.experimental_rerun()
     else:
-        st.write("No queries yet.")
+        st.info("No queries yet.")
 
-# ========================
-# LLM + SQL Chain
-# ========================
+# Schema display before input
+st.subheader("📚 Available Tables and Columns")
+st.markdown(schema_display or "No tables yet. Upload one above ☝️")
+
+# Prompt setup
+prompt = PromptTemplate(
+    input_variables=["schema", "question"],
+    template="""
+You are a SQL expert. Based on the database schema and the user's question, write a correct SQLite SQL query.
+
+Use only the tables and columns provided below.
+
+Schema:
+{schema}
+
+User Question:
+{question}
+
+SQL Query:
+"""
+)
+
 llm = ChatOpenAI(temperature=0, model_name="gpt-4")
-db_chain = SQLDatabaseChain.from_llm(llm=llm, db=db, verbose=True, return_intermediate_steps=True)
+chain = LLMChain(llm=llm, prompt=prompt)
 
-# ========================
-# Natural Language Input
-# ========================
-st.subheader("🔍 Ask a question across all tables (joins supported)")
+# User input
+st.subheader("🔍 Ask your question (e.g., 'Show all customers from Canada')")
 question = st.text_input("Your question:")
 
 if question:
     try:
-        result = db_chain(question)
-        sql_query = result["intermediate_steps"][0]
         st.session_state.query_history.append(question)
+        sql_query = chain.run({"schema": schema_text, "question": question})
 
-        # Safety filter
+        # Block dangerous SQL
         forbidden = ["drop", "delete", "update", "insert", "alter", "truncate"]
-        if any(word in sql_query.lower() for word in forbidden):
-            st.error("❌ Destructive SQL command detected.")
+        if any(f in sql_query.lower() for f in forbidden):
+            st.error("❌ Unsafe SQL command detected.")
         else:
             try:
                 conn = sqlite3.connect(DB_PATH)
@@ -115,16 +150,12 @@ if question:
                 st.success("✅ Query executed!")
                 st.dataframe(df, use_container_width=True)
 
-                # Download button
                 csv = df.to_csv(index=False).encode("utf-8")
                 st.download_button("📥 Download results as CSV", csv, "query_results.csv", "text/csv")
-            except:
-                st.markdown("**Raw Response:**")
-                st.markdown(result["result"])
-
-            st.markdown("---")
+            except Exception:
+                st.warning("⚠️ The SQL query was valid, but the table or data may not exist.")
             st.markdown("**Generated SQL:**")
             st.code(sql_query, language="sql")
 
     except Exception as e:
-        st.error(f"❌ Error while processing your query:\n\n{e}")
+        st.error(f"❌ Error from LLM:\n\n{e}")
