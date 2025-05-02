@@ -1,9 +1,10 @@
 streamlit
-pandas
-openpyxl
-python-dotenv         
+streamlit-webrtc
+pydub
+openai
 langchain
 langchain-openai
 langchain-community
 langchain-experimental
 sqlalchemy
+pandas
