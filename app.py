@@ -1,175 +1,161 @@
 import os
-import io
 import sqlite3
+import time
 import pandas as pd
 import streamlit as st
 from datetime import datetime
+from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_community.utilities.sql_database import SQLDatabase
 from langchain_experimental.sql import SQLDatabaseChain
 from streamlit_webrtc import webrtc_streamer, WebRtcMode, ClientSettings
-import av
 import openai
 
-# Load OpenAI API Key
+# Load environment variables
+load_dotenv()
 openai.api_key = os.getenv("OPENAI_API_KEY")
-
-# App Config
-st.set_page_config(page_title="Text-to-SQL Agent with Voice Input", layout="wide")
-st.markdown(
-    """
-    <style>
-    body {
-        background-color: #111827;
-        color: #f3f4f6;
-    }
-    .stApp {
-        background-color: #111827;
-    }
-    .stTextInput input {
-        background-color: #1f2937;
-        color: white;
-        font-size: 16px;
-    }
-    .stSelectbox div {
-        background-color: #1f2937;
-        color: white;
-    }
-    .stDataFrame {
-        background-color: #1f2937;
-        color: white;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True
-)
-
-st.title("🧠 Text-to-SQL Agent with Voice Input")
-
 DB_PATH = "my_database.db"
-history_file = "query_history.csv"
-uploaded_log = "upload_log.csv"
 
-# === Setup DB ===
-def connect_db():
-    return SQLDatabase.from_uri(f"sqlite:///{DB_PATH}")
+# App config
+st.set_page_config(page_title="Text-to-SQL Agent", layout="wide")
+st.markdown("<h1 style='color:#58a6ff;'>🧠 AI SQL Assistant</h1>", unsafe_allow_html=True)
 
-def add_file(uploaded_file):
-    table = os.path.splitext(uploaded_file.name)[0].strip().replace(" ", "_")
-    if uploaded_file.name.endswith(".csv"):
-        df = pd.read_csv(uploaded_file)
-    elif uploaded_file.name.endswith(".xlsx"):
-        df = pd.read_excel(uploaded_file)
-    else:
-        st.warning("⚠️ Only CSV and XLSX are supported.")
-        return
+# Initialize session state
+if "query_history" not in st.session_state:
+    st.session_state.query_history = []
 
-    conn = sqlite3.connect(DB_PATH)
-    df.to_sql(table, conn, if_exists="replace", index=False)
-    conn.close()
+if "uploaded_files" not in st.session_state:
+    st.session_state.uploaded_files = []
 
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    log_df = pd.DataFrame([[uploaded_file.name, now]], columns=["filename", "uploaded_at"])
-    if os.path.exists(uploaded_log):
-        log_df.to_csv(uploaded_log, mode="a", header=False, index=False)
-    else:
-        log_df.to_csv(uploaded_log, index=False)
+# =========================
+# 🎤 Voice Input with Whisper
+# =========================
+def transcribe_audio(audio_bytes):
+    try:
+        transcript = openai.Audio.transcribe("whisper-1", audio_bytes)
+        return transcript["text"]
+    except Exception as e:
+        return f"Error transcribing: {e}"
 
-    st.success(f"✅ Uploaded '{uploaded_file.name}' as '{table}'")
-
-# === Sidebar: Table Preview ===
-with st.sidebar:
-    st.header("📊 Table Preview")
-    db = connect_db()
-    tables = db.get_usable_table_names()
-    selected_table = st.selectbox("Preview table", sorted(tables))
-
-    if selected_table:
-        conn = sqlite3.connect(DB_PATH)
-        preview = pd.read_sql(f"SELECT * FROM {selected_table} LIMIT 5", conn)
-        st.dataframe(preview)
-
-    st.markdown("---")
-    st.subheader("📌 Schema")
-    for table in sorted(tables):
-        st.markdown(f"**🗂️ {table}**")
-        df = pd.read_sql(f"PRAGMA table_info({table});", conn)
-        schema_info = "\n".join([f"- `{row['name']}` ({row['type']})" for _, row in df.iterrows()])
-        st.markdown(schema_info)
-
-    st.markdown("---")
-    st.subheader("🕓 Upload History")
-    if os.path.exists(uploaded_log):
-        logs = pd.read_csv(uploaded_log)
-        st.dataframe(logs.tail(5))
-
-    st.markdown("---")
-    st.subheader("🕘 Query History")
-    if os.path.exists(history_file):
-        queries = pd.read_csv(history_file)
-        if st.button("🧹 Clear History"):
-            os.remove(history_file)
-            st.success("History cleared.")
-        else:
-            st.dataframe(queries.tail(5))
-
-# === LLM Setup ===
-llm = ChatOpenAI(temperature=0, model_name="gpt-4")
-db_chain = SQLDatabaseChain.from_llm(llm=llm, db=db, return_intermediate_steps=True, verbose=False)
-
-# === 🎤 Voice Capture ===
-st.subheader("🎤 Speak your question (voice-to-SQL)")
-text_result = st.empty()
-recorded_audio = webrtc_streamer(
-    key="voice",
-    mode=WebRtcMode.SENDRECV,
-    client_settings=ClientSettings(
-        media_stream_constraints={"audio": True, "video": False},
-        rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+with st.expander("🎙️ Speak your question (Click 'Start')"):
+    webrtc_ctx = webrtc_streamer(
+        key="speech-to-text",
+        mode=WebRtcMode.SENDONLY,
+        client_settings=ClientSettings(
+            media_stream_constraints={"audio": True, "video": False},
+            rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
+        ),
+        audio_receiver_size=512,
     )
+
+    if webrtc_ctx.audio_receiver:
+        audio_bytes = b"".join([frame.to_ndarray().tobytes() for frame in webrtc_ctx.audio_receiver.iter_frames()])
+        if audio_bytes:
+            with st.spinner("Transcribing..."):
+                with open("temp.wav", "wb") as f:
+                    f.write(audio_bytes)
+                with open("temp.wav", "rb") as f:
+                    transcript = transcribe_audio(f)
+                    st.success(f"🗣️ You said: {transcript}")
+                    st.session_state.transcribed_input = transcript
+
+# =========================
+# 📂 Upload File to DB
+# =========================
+with st.expander("📁 Upload CSV or Excel"):
+    uploaded_file = st.file_uploader("Upload .csv or .xlsx", type=["csv", "xlsx"])
+    if uploaded_file:
+        table_name = os.path.splitext(uploaded_file.name)[0].replace(" ", "_")
+        df = pd.read_csv(uploaded_file) if uploaded_file.name.endswith(".csv") else pd.read_excel(uploaded_file)
+        conn = sqlite3.connect(DB_PATH)
+        df.to_sql(table_name, conn, if_exists="replace", index=False)
+        conn.close()
+        st.session_state.uploaded_files.append((table_name, datetime.now()))
+        st.success(f"✅ Added `{table_name}` to the database.")
+
+# =========================
+# 🧠 Set up LangChain Agent
+# =========================
+db = SQLDatabase.from_uri(f"sqlite:///{DB_PATH}")
+schema_text = db.get_table_info()
+
+llm = ChatOpenAI(model_name="gpt-4", temperature=0)
+db_chain = SQLDatabaseChain.from_llm(
+    llm=llm, db=db, verbose=True, return_intermediate_steps=True
 )
 
-if recorded_audio.audio_receiver:
-    audio = recorded_audio.audio_receiver.get_frames(timeout=5)[0]
-    audio_bytes = audio.to_ndarray().tobytes()
-    with st.spinner("Transcribing voice..."):
-        response = openai.Audio.transcribe("whisper-1", file=io.BytesIO(audio_bytes), filename="input.wav")
-        spoken_text = response["text"]
-        text_result.text_area("🎙️ Transcribed text", spoken_text, height=80)
-else:
-    spoken_text = None
+# =========================
+# 🔍 Explore Schema
+# =========================
+with st.sidebar:
+    st.subheader("📊 Table Viewer")
+    try:
+        tables = db.get_usable_table_names()
+        selected = st.selectbox("Choose a table", sorted(tables))
+        if selected:
+            conn = sqlite3.connect(DB_PATH)
+            st.write(f"Preview of `{selected}`:")
+            st.dataframe(pd.read_sql_query(f"SELECT * FROM {selected} LIMIT 5", conn))
+            conn.close()
+    except Exception as e:
+        st.error(f"Error loading tables: {e}")
 
-# === 🧠 Text-to-SQL Input ===
-st.subheader("🔎 Ask your question")
-default_hint = "🎤 Speak or type your question (e.g. show top 5 products)..."
-question = st.text_input("Your question", value=spoken_text or "", placeholder=default_hint)
+    st.subheader("📋 Schema Explorer")
+    st.code(schema_text, language="sql")
+
+    st.subheader("📜 Uploaded Files History")
+    for table, date in st.session_state.uploaded_files:
+        st.write(f"• `{table}` at {date.strftime('%Y-%m-%d %H:%M:%S')}")
+
+# =========================
+# 💬 Ask a Question
+# =========================
+st.subheader("💬 Ask your question")
+input_placeholder = "Type or speak your question..."
+question = st.text_input("Question:", value=st.session_state.get("transcribed_input", ""), placeholder=input_placeholder)
 
 if question:
     try:
         result = db_chain(question)
-        sql = result["intermediate_steps"][0]
+        sql_query = result["intermediate_steps"][0]
 
-        if any(x in sql.lower() for x in ["drop", "delete", "alter", "truncate"]):
-            st.error("⛔ Destructive query blocked.")
+        # 🔒 Block risky SQL
+        if any(cmd in sql_query.lower() for cmd in ["drop", "delete", "update", "insert", "alter", "truncate"]):
+            st.error("❌ Destructive query blocked.")
         else:
+            # Display query results
+            conn = sqlite3.connect(DB_PATH)
             try:
-                conn = sqlite3.connect(DB_PATH)
-                df = pd.read_sql_query(sql, conn)
-                st.success("✅ Query successful!")
+                df = pd.read_sql_query(sql_query, conn)
+                st.success("✅ Query executed!")
                 st.dataframe(df)
             except:
-                st.markdown(f"**Result:** {result['result']}")
-
-            st.markdown("---")
-            st.markdown("🧾 **Generated SQL:**")
-            st.code(sql, language="sql")
+                st.info(result["result"])
 
             # Save history
-            new_log = pd.DataFrame([[datetime.now(), question, sql]], columns=["time", "query", "sql"])
-            if os.path.exists(history_file):
-                new_log.to_csv(history_file, mode="a", header=False, index=False)
-            else:
-                new_log.to_csv(history_file, index=False)
+            st.session_state.query_history.append((question, sql_query))
+
+            # Show SQL
+            st.markdown("**Generated SQL:**")
+            st.code(sql_query, language="sql")
+
+            # Offer download
+            if 'df' in locals() and not df.empty:
+                csv = df.to_csv(index=False).encode("utf-8")
+                st.download_button("⬇️ Download Results", csv, "results.csv", "text/csv")
 
     except Exception as e:
         st.error(f"❌ Error: {e}")
+
+# =========================
+# 🧾 Query History
+# =========================
+st.markdown("---")
+with st.expander("📚 Query History"):
+    if st.session_state.query_history:
+        for q, sql in reversed(st.session_state.query_history[-10:]):
+            st.markdown(f"**Q:** {q}\n\n```sql\n{sql}\n```")
+        if st.button("🧹 Clear History"):
+            st.session_state.query_history.clear()
+    else:
+        st.info("No queries yet.")
