@@ -8,5 +8,4 @@ langchain-openai
 langchain-community
 langchain-experimental
 sqlalchemy
-# Voice/whisper dependencies
 streamlit.components.v1
