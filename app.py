@@ -42,7 +42,7 @@ table {
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🎙️ Voice-Powered SQL Assistant")
+st.title("🎙️ Voice & Text SQL Assistant")
 
 DB_PATH = "my_database.db"
 
@@ -61,58 +61,75 @@ with st.sidebar:
         tables = db.get_usable_table_names()
         for table in sorted(tables):
             st.markdown(f"- `{table}`")
+            with sqlite3.connect(DB_PATH) as conn:
+                cols = pd.read_sql_query(f"PRAGMA table_info('{table}')", conn)
+                col_names = cols['name'].tolist()
+                st.caption(f"    Columns: {', '.join(col_names)}")
     except Exception as e:
         st.warning(f"⚠️ Failed to fetch tables: {e}")
 
 # ================= Voice Recorder ====================
-st.markdown("### 🔊 Click and Speak your query")
+col1, col2 = st.columns(2)
 
-custom_html = """
-<script>
-let mediaRecorder;
-let audioChunks = [];
-let stream;
+with col1:
+    st.markdown("### 🔊 Click and Speak your query")
+    custom_html = """
+    <script>
+    let mediaRecorder;
+    let audioChunks = [];
+    let stream;
 
-async function startRecording() {
-    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    mediaRecorder = new MediaRecorder(stream);
+    async function startRecording() {
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        mediaRecorder = new MediaRecorder(stream);
 
-    mediaRecorder.ondataavailable = (event) => {
-        if (event.data.size > 0) audioChunks.push(event.data);
-    };
+        mediaRecorder.ondataavailable = (event) => {
+            if (event.data.size > 0) audioChunks.push(event.data);
+        };
 
-    mediaRecorder.onstop = async () => {
-        const audioBlob = new Blob(audioChunks, { type: 'audio/wav' });
-        const arrayBuffer = await audioBlob.arrayBuffer();
-        const base64Audio = btoa(String.fromCharCode(...new Uint8Array(arrayBuffer)));
+        mediaRecorder.onstop = async () => {
+            const audioBlob = new Blob(audioChunks, { type: 'audio/wav' });
+            const arrayBuffer = await audioBlob.arrayBuffer();
+            const base64Audio = btoa(String.fromCharCode(...new Uint8Array(arrayBuffer)));
 
-        window.parent.postMessage({ type: 'audioBase64', data: base64Audio }, '*');
-        audioChunks = [];
-    };
+            window.parent.postMessage({ type: 'audioBase64', data: base64Audio }, '*');
+            audioChunks = [];
+        };
 
-    mediaRecorder.start();
-    document.getElementById('status').innerText = '🎙️ Recording...';
-}
+        mediaRecorder.start();
+        document.getElementById('status').innerText = '🎙️ Recording...';
+    }
 
-function stopRecording() {
-    mediaRecorder.stop();
-    stream.getTracks().forEach(track => track.stop());
-    document.getElementById('status').innerText = '✅ Recording stopped';
-}
-</script>
-<button onclick="startRecording()">🎤 Start</button>
-<button onclick="stopRecording()">⏹️ Stop & Transcribe</button>
-<p id="status"></p>
-"""
+    function stopRecording() {
+        mediaRecorder.stop();
+        stream.getTracks().forEach(track => track.stop());
+        document.getElementById('status').innerText = '✅ Recording stopped';
+    }
+    </script>
+    <button onclick="startRecording()">🎤 Start</button>
+    <button onclick="stopRecording()">⏹️ Stop & Transcribe</button>
+    <p id="status"></p>
+    """
+    st.components.v1.html(custom_html, height=150)
 
-component = st.components.v1.html(custom_html, height=150)
+with col2:
+    st.markdown("### ⌨️ Or Type your query")
+    typed_query = st.text_input("", placeholder="Type your question here...")
+    if typed_query:
+        result = db_chain(typed_query)
+        sql_query = result['intermediate_steps'][0]
+
+        if any(word in sql_query.lower() for word in ["drop", "delete", "update"]):
+            st.error("❌ Dangerous SQL blocked.")
+        else:
+            st.success("✅ Query executed successfully!")
+            st.markdown("**Generated SQL:**")
+            st.code(sql_query)
+            st.dataframe(result['result'])
 
 # ================= Transcription Logic ====================
 if "base64_audio" not in st.session_state:
     st.session_state.base64_audio = ""
-
-st.markdown("---")
-st.markdown("### 📄 Transcribed Query")
 
 def transcribe_audio(base64_audio):
     audio_bytes = base64.b64decode(base64_audio)
@@ -124,7 +141,7 @@ def transcribe_audio(base64_audio):
     )
     return response.json().get("text", "")
 
-# Listener for audio from frontend
+# JS listener to get audio from browser
 st.components.v1.html("""
 <script>
 window.addEventListener("message", (event) => {
@@ -138,12 +155,10 @@ window.addEventListener("message", (event) => {
 </script>
 """, height=0)
 
-# ================= Voice Transcription Backend ====================
+# Handle audio transcription
 audio_base64 = st.experimental_get_query_params().get("audio")
-
 if audio_base64:
     transcription = transcribe_audio(audio_base64[0])
-    st.session_state.base64_audio = ""
     st.text_area("📝 Whisper Transcript", transcription)
 
     if transcription:
