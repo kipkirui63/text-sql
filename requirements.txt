@@ -1,12 +1,12 @@
 streamlit
-streamlit-webrtc
-pydub
-openai
+pandas
+openpyxl
+python-dotenv
+requests
 langchain
 langchain-openai
 langchain-community
 langchain-experimental
 sqlalchemy
-pandas
-
-av
+# Voice/whisper dependencies
+streamlit.components.v1
