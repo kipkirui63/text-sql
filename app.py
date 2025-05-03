@@ -150,7 +150,10 @@ with col2:
             st.success("✅ Query executed successfully!")
             st.markdown("**Generated SQL:**")
             st.code(sql_query)
-            st.dataframe(result['result'])
+            try:
+                st.dataframe(result["result"]) if isinstance(result["result"], pd.DataFrame) else st.markdown(result["result"])
+            except Exception as e:
+                st.warning(f"⚠️ Unable to display result: {e}")
 
 # ================= Transcription Logic ====================
 if "base64_audio" not in st.session_state:
@@ -196,6 +199,9 @@ if audio_base64:
             st.success("✅ Query executed successfully!")
             st.markdown("**Generated SQL:**")
             st.code(sql_query)
-            st.dataframe(result['result'])
+            try:
+                st.dataframe(result["result"]) if isinstance(result["result"], pd.DataFrame) else st.markdown(result["result"])
+            except Exception as e:
+                st.warning(f"⚠️ Unable to display result: {e}")
 else:
     st.info("🎤 Speak and click 'Stop & Transcribe' to query.")
