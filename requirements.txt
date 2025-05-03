@@ -8,6 +8,5 @@ langchain-community
 langchain-experimental
 sqlalchemy
 pandas
-av
-openpyxl
 
+av

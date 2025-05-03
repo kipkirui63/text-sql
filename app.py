@@ -144,7 +144,7 @@ with col2:
         result = db_chain(typed_query)
         sql_query = result['intermediate_steps'][0]
 
-        if any(word in sql_query.lower() for word in ["drop", "delete", "update"]):
+        if isinstance(sql_query, str) and any(word in sql_query.lower() for word in ["drop", "delete", "update"]):
             st.error("❌ Dangerous SQL blocked.")
         else:
             st.success("✅ Query executed successfully!")
@@ -190,7 +190,7 @@ if audio_base64:
         result = db_chain(transcription)
         sql_query = result['intermediate_steps'][0]
 
-        if any(word in sql_query.lower() for word in ["drop", "delete", "update"]):
+        if isinstance(sql_query, str) and any(word in sql_query.lower() for word in ["drop", "delete", "update"]):
             st.error("❌ Dangerous SQL blocked.")
         else:
             st.success("✅ Query executed successfully!")
