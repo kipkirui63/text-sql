@@ -1,161 +1,123 @@
+# app.py
 import os
-import sqlite3
-import time
-import pandas as pd
+import base64
+import requests
 import streamlit as st
-from datetime import datetime
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_community.utilities.sql_database import SQLDatabase
 from langchain_experimental.sql import SQLDatabaseChain
-from streamlit_webrtc import webrtc_streamer, WebRtcMode, ClientSettings
-import openai
 
 # Load environment variables
 load_dotenv()
-openai.api_key = os.getenv("OPENAI_API_KEY")
-DB_PATH = "my_database.db"
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 # App config
-st.set_page_config(page_title="Text-to-SQL Agent", layout="wide")
-st.markdown("<h1 style='color:#58a6ff;'>🧠 AI SQL Assistant</h1>", unsafe_allow_html=True)
+st.set_page_config(page_title="Voice-to-SQL", layout="wide")
+st.title("🎙️ Voice-Powered SQL Assistant")
 
-# Initialize session state
-if "query_history" not in st.session_state:
-    st.session_state.query_history = []
+DB_PATH = "my_database.db"
 
-if "uploaded_files" not in st.session_state:
-    st.session_state.uploaded_files = []
+# ================= DB Setup ====================
+def connect_to_db():
+    return SQLDatabase.from_uri(f"sqlite:///{DB_PATH}")
 
-# =========================
-# 🎤 Voice Input with Whisper
-# =========================
-def transcribe_audio(audio_bytes):
-    try:
-        transcript = openai.Audio.transcribe("whisper-1", audio_bytes)
-        return transcript["text"]
-    except Exception as e:
-        return f"Error transcribing: {e}"
+db = connect_to_db()
+llm = ChatOpenAI(temperature=0, model_name="gpt-4")
+db_chain = SQLDatabaseChain.from_llm(llm=llm, db=db, verbose=True, return_intermediate_steps=True)
 
-with st.expander("🎙️ Speak your question (Click 'Start')"):
-    webrtc_ctx = webrtc_streamer(
-        key="speech-to-text",
-        mode=WebRtcMode.SENDONLY,
-        client_settings=ClientSettings(
-            media_stream_constraints={"audio": True, "video": False},
-            rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
-        ),
-        audio_receiver_size=512,
-    )
+# ================= Voice Recorder ====================
+st.markdown("### 🔊 Click and Speak your query")
 
-    if webrtc_ctx.audio_receiver:
-        audio_bytes = b"".join([frame.to_ndarray().tobytes() for frame in webrtc_ctx.audio_receiver.iter_frames()])
-        if audio_bytes:
-            with st.spinner("Transcribing..."):
-                with open("temp.wav", "wb") as f:
-                    f.write(audio_bytes)
-                with open("temp.wav", "rb") as f:
-                    transcript = transcribe_audio(f)
-                    st.success(f"🗣️ You said: {transcript}")
-                    st.session_state.transcribed_input = transcript
+custom_html = """
+<script>
+let mediaRecorder;
+let audioChunks = [];
+let stream;
 
-# =========================
-# 📂 Upload File to DB
-# =========================
-with st.expander("📁 Upload CSV or Excel"):
-    uploaded_file = st.file_uploader("Upload .csv or .xlsx", type=["csv", "xlsx"])
-    if uploaded_file:
-        table_name = os.path.splitext(uploaded_file.name)[0].replace(" ", "_")
-        df = pd.read_csv(uploaded_file) if uploaded_file.name.endswith(".csv") else pd.read_excel(uploaded_file)
-        conn = sqlite3.connect(DB_PATH)
-        df.to_sql(table_name, conn, if_exists="replace", index=False)
-        conn.close()
-        st.session_state.uploaded_files.append((table_name, datetime.now()))
-        st.success(f"✅ Added `{table_name}` to the database.")
+async function startRecording() {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    mediaRecorder = new MediaRecorder(stream);
 
-# =========================
-# 🧠 Set up LangChain Agent
-# =========================
-db = SQLDatabase.from_uri(f"sqlite:///{DB_PATH}")
-schema_text = db.get_table_info()
+    mediaRecorder.ondataavailable = (event) => {
+        if (event.data.size > 0) audioChunks.push(event.data);
+    };
 
-llm = ChatOpenAI(model_name="gpt-4", temperature=0)
-db_chain = SQLDatabaseChain.from_llm(
-    llm=llm, db=db, verbose=True, return_intermediate_steps=True
-)
+    mediaRecorder.onstop = async () => {
+        const audioBlob = new Blob(audioChunks, { type: 'audio/wav' });
+        const arrayBuffer = await audioBlob.arrayBuffer();
+        const base64Audio = btoa(String.fromCharCode(...new Uint8Array(arrayBuffer)));
 
-# =========================
-# 🔍 Explore Schema
-# =========================
-with st.sidebar:
-    st.subheader("📊 Table Viewer")
-    try:
-        tables = db.get_usable_table_names()
-        selected = st.selectbox("Choose a table", sorted(tables))
-        if selected:
-            conn = sqlite3.connect(DB_PATH)
-            st.write(f"Preview of `{selected}`:")
-            st.dataframe(pd.read_sql_query(f"SELECT * FROM {selected} LIMIT 5", conn))
-            conn.close()
-    except Exception as e:
-        st.error(f"Error loading tables: {e}")
+        window.parent.postMessage({ type: 'audioBase64', data: base64Audio }, '*');
+        audioChunks = [];
+    };
 
-    st.subheader("📋 Schema Explorer")
-    st.code(schema_text, language="sql")
+    mediaRecorder.start();
+    document.getElementById('status').innerText = '🎙️ Recording...';
+}
 
-    st.subheader("📜 Uploaded Files History")
-    for table, date in st.session_state.uploaded_files:
-        st.write(f"• `{table}` at {date.strftime('%Y-%m-%d %H:%M:%S')}")
+function stopRecording() {
+    mediaRecorder.stop();
+    stream.getTracks().forEach(track => track.stop());
+    document.getElementById('status').innerText = '✅ Recording stopped';
+}
+</script>
+<button onclick="startRecording()">Start Recording</button>
+<button onclick="stopRecording()">Stop & Transcribe</button>
+<p id="status"></p>
+"""
 
-# =========================
-# 💬 Ask a Question
-# =========================
-st.subheader("💬 Ask your question")
-input_placeholder = "Type or speak your question..."
-question = st.text_input("Question:", value=st.session_state.get("transcribed_input", ""), placeholder=input_placeholder)
+component = st.components.v1.html(custom_html, height=150)
 
-if question:
-    try:
-        result = db_chain(question)
-        sql_query = result["intermediate_steps"][0]
+# ================= Transcription Logic ====================
+if "base64_audio" not in st.session_state:
+    st.session_state.base64_audio = ""
 
-        # 🔒 Block risky SQL
-        if any(cmd in sql_query.lower() for cmd in ["drop", "delete", "update", "insert", "alter", "truncate"]):
-            st.error("❌ Destructive query blocked.")
-        else:
-            # Display query results
-            conn = sqlite3.connect(DB_PATH)
-            try:
-                df = pd.read_sql_query(sql_query, conn)
-                st.success("✅ Query executed!")
-                st.dataframe(df)
-            except:
-                st.info(result["result"])
-
-            # Save history
-            st.session_state.query_history.append((question, sql_query))
-
-            # Show SQL
-            st.markdown("**Generated SQL:**")
-            st.code(sql_query, language="sql")
-
-            # Offer download
-            if 'df' in locals() and not df.empty:
-                csv = df.to_csv(index=False).encode("utf-8")
-                st.download_button("⬇️ Download Results", csv, "results.csv", "text/csv")
-
-    except Exception as e:
-        st.error(f"❌ Error: {e}")
-
-# =========================
-# 🧾 Query History
-# =========================
 st.markdown("---")
-with st.expander("📚 Query History"):
-    if st.session_state.query_history:
-        for q, sql in reversed(st.session_state.query_history[-10:]):
-            st.markdown(f"**Q:** {q}\n\n```sql\n{sql}\n```")
-        if st.button("🧹 Clear History"):
-            st.session_state.query_history.clear()
-    else:
-        st.info("No queries yet.")
+st.markdown("### 📄 Transcribed Query")
+
+def transcribe_audio(base64_audio):
+    audio_bytes = base64.b64decode(base64_audio)
+    response = requests.post(
+        "https://api.openai.com/v1/audio/transcriptions",
+        headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+        files={"file": ("audio.wav", audio_bytes, "audio/wav")},
+        data={"model": "whisper-1"}
+    )
+    return response.json().get("text", "")
+
+# Listener for audio from frontend
+st.components.v1.html("""
+<script>
+window.addEventListener("message", (event) => {
+    if (event.data.type === 'audioBase64') {
+        const audio = event.data.data;
+        const queryParams = new URLSearchParams(window.location.search);
+        queryParams.set("audio", audio);
+        window.location.search = queryParams.toString();
+    }
+});
+</script>
+""", height=0)
+
+# ================= Voice Transcription Backend ====================
+audio_base64 = st.experimental_get_query_params().get("audio")
+
+if audio_base64:
+    transcription = transcribe_audio(audio_base64[0])
+    st.session_state.base64_audio = ""
+    st.text_area("📝 Whisper Transcript", transcription)
+
+    if transcription:
+        result = db_chain(transcription)
+        sql_query = result['intermediate_steps'][0]
+
+        if any(word in sql_query.lower() for word in ["drop", "delete", "update"]):
+            st.error("❌ Dangerous SQL blocked.")
+        else:
+            st.success("✅ Query executed successfully!")
+            st.markdown("**Generated SQL:**")
+            st.code(sql_query)
+            st.dataframe(result['result'])
+else:
+    st.info("🎤 Speak and click 'Stop & Transcribe' to query.")
