@@ -9,3 +9,5 @@ langchain-experimental
 sqlalchemy
 pandas
 av
+openpyxl
+
