@@ -2,6 +2,8 @@
 import os
 import base64
 import requests
+import sqlite3
+import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
@@ -13,7 +15,33 @@ load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 # App config
-st.set_page_config(page_title="Voice-to-SQL", layout="wide")
+st.set_page_config(page_title="Voice-to-SQL", layout="wide", initial_sidebar_state="expanded")
+
+# ================== Dark Mode Styling ==================
+st.markdown("""
+<style>
+body {
+    background-color: #0e1117;
+    color: #fafafa;
+}
+button {
+    background-color: #1f77b4 !important;
+    color: white !important;
+    border-radius: 5px !important;
+}
+h1, h2, h3 {
+    color: #61dafb;
+}
+textarea, .stTextInput, .stTextArea {
+    background-color: #262730 !important;
+    color: white !important;
+}
+table {
+    background-color: #1e1e1e;
+}
+</style>
+""", unsafe_allow_html=True)
+
 st.title("🎙️ Voice-Powered SQL Assistant")
 
 DB_PATH = "my_database.db"
@@ -25,6 +53,16 @@ def connect_to_db():
 db = connect_to_db()
 llm = ChatOpenAI(temperature=0, model_name="gpt-4")
 db_chain = SQLDatabaseChain.from_llm(llm=llm, db=db, verbose=True, return_intermediate_steps=True)
+
+# ================= Schema Explorer ====================
+with st.sidebar:
+    st.header("📊 Available Tables")
+    try:
+        tables = db.get_usable_table_names()
+        for table in sorted(tables):
+            st.markdown(f"- `{table}`")
+    except Exception as e:
+        st.warning(f"⚠️ Failed to fetch tables: {e}")
 
 # ================= Voice Recorder ====================
 st.markdown("### 🔊 Click and Speak your query")
@@ -62,8 +100,8 @@ function stopRecording() {
     document.getElementById('status').innerText = '✅ Recording stopped';
 }
 </script>
-<button onclick="startRecording()">Start Recording</button>
-<button onclick="stopRecording()">Stop & Transcribe</button>
+<button onclick="startRecording()">🎤 Start</button>
+<button onclick="stopRecording()">⏹️ Stop & Transcribe</button>
 <p id="status"></p>
 """
 
