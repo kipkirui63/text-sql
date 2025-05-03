@@ -50,6 +50,31 @@ DB_PATH = "my_database.db"
 def connect_to_db():
     return SQLDatabase.from_uri(f"sqlite:///{DB_PATH}")
 
+def add_file_to_db(uploaded_file):
+    file_name = uploaded_file.name
+    table_name = os.path.splitext(file_name)[0]
+
+    if file_name.endswith(".csv"):
+        df = pd.read_csv(uploaded_file)
+    elif file_name.endswith(".xlsx"):
+        df = pd.read_excel(uploaded_file)
+    else:
+        st.warning("⚠️ Only .csv or .xlsx files are supported.")
+        return
+
+    conn = sqlite3.connect(DB_PATH)
+    df.to_sql(table_name, conn, if_exists="replace", index=False)
+    conn.close()
+    st.success(f"✅ File '{file_name}' added as table '{table_name}'")
+
+# Upload placeholder
+with st.sidebar:
+    st.header("📂 Upload New File")
+    uploaded_file = st.file_uploader("Upload CSV or Excel", type=["csv", "xlsx"])
+    if uploaded_file is not None:
+        add_file_to_db(uploaded_file)
+
+# Connect DB
 db = connect_to_db()
 llm = ChatOpenAI(temperature=0, model_name="gpt-4")
 db_chain = SQLDatabaseChain.from_llm(llm=llm, db=db, verbose=True, return_intermediate_steps=True)
@@ -141,7 +166,7 @@ def transcribe_audio(base64_audio):
     )
     return response.json().get("text", "")
 
-# JS listener to get audio from browser
+# JS listener
 st.components.v1.html("""
 <script>
 window.addEventListener("message", (event) => {
