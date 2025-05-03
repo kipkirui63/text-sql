@@ -150,10 +150,7 @@ with col2:
     typed_query = st.text_input("Query", placeholder="Type your question here...", label_visibility="collapsed")
     if typed_query:
         result = db_chain(typed_query)
-        sql_query = result['intermediate_steps'][0]
-        if isinstance(sql_query, dict) and 'SQLQuery' in sql_query:
-            sql_query = sql_query['SQLQuery']
-        sql_query = str(sql_query)
+        sql_query = str(result['intermediate_steps'][0])
 
         if any(word in sql_query.lower() for word in ["drop", "delete", "update"]):
             st.error("❌ Dangerous SQL blocked.")
@@ -205,10 +202,7 @@ if audio_base64:
 
     if transcription:
         result = db_chain(transcription)
-        sql_query = result['intermediate_steps'][0]
-        if isinstance(sql_query, dict) and 'SQLQuery' in sql_query:
-            sql_query = sql_query['SQLQuery']
-        sql_query = str(sql_query)
+        sql_query = str(result['intermediate_steps'][0])
 
         if any(word in sql_query.lower() for word in ["drop", "delete", "update"]):
             st.error("❌ Dangerous SQL blocked.")
@@ -223,3 +217,5 @@ if audio_base64:
                 st.download_button("⬇️ Download CSV", csv, "query_results.csv", "text/csv")
             except Exception as e:
                 st.error(f"⚠️ Failed to execute query: {e}")
+else:
+    st.info("🎤 Speak and click 'Stop & Transcribe' to query.")
