@@ -1,221 +1,187 @@
-# app.py
 import os
-import base64
-import requests
 import sqlite3
+import tempfile
 import pandas as pd
 import streamlit as st
-from dotenv import load_dotenv
+from langchain.prompts import PromptTemplate
 from langchain_openai import ChatOpenAI
+from langchain.chains import LLMChain
 from langchain_community.utilities.sql_database import SQLDatabase
-from langchain_experimental.sql import SQLDatabaseChain
+from streamlit_webrtc import webrtc_streamer
+import openai
+from datetime import datetime
 
-# Load environment variables
-load_dotenv()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+st.set_page_config(page_title="Voice SQL Agent", layout="wide")
+st.title("🧠 Text-to-SQL Agent with Voice Input")
 
-# App config
-st.set_page_config(page_title="Voice-to-SQL", layout="wide", initial_sidebar_state="expanded")
-
-# ================== Dark Mode Styling ==================
-st.markdown("""
-<style>
-body {
-    background-color: #0e1117;
-    color: #fafafa;
-}
-button {
-    background-color: #1f77b4 !important;
-    color: white !important;
-    border-radius: 5px !important;
-}
-h1, h2, h3 {
-    color: #61dafb;
-}
-textarea, .stTextInput, .stTextArea {
-    background-color: #262730 !important;
-    color: white !important;
-}
-table {
-    background-color: #1e1e1e;
-}
-</style>
-""", unsafe_allow_html=True)
-
-st.title("🎙️ Voice & Text SQL Assistant")
-
+openai.api_key = os.getenv("OPENAI_API_KEY")
 DB_PATH = "my_database.db"
+if "query_history" not in st.session_state:
+    st.session_state.query_history = []
+if "transcribed_text" not in st.session_state:
+    st.session_state.transcribed_text = ""
 
-# ================= DB Setup ====================
 def connect_to_db():
     return SQLDatabase.from_uri(f"sqlite:///{DB_PATH}")
 
+def get_all_schemas(db) -> str:
+    schema_str = ""
+    for table in db.get_usable_table_names():
+        try:
+            columns = db.run(f"PRAGMA table_info({table})")
+            col_lines = [f"{col['name']} ({col['type']})" for col in columns]
+            schema_str += f"Table: {table}\\nColumns: {', '.join(col_lines)}\\n\\n"
+        except:
+            continue
+    return schema_str.strip()
+
+def format_schema_as_text(db) -> str:
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        tables = pd.read_sql_query("SELECT name FROM sqlite_master WHERE type='table';", conn)["name"]
+        output = ""
+        for table in tables:
+            df = pd.read_sql_query(f"PRAGMA table_info({table});", conn)
+            output += f"📄 **{table}**\\n"
+            for i, row in df.iterrows():
+                output += f"- `{row['name']}` ({row['type']})\\n"
+            output += "\\n"
+        return output
+    except:
+        return ""
+
 def add_file_to_db(uploaded_file):
     file_name = uploaded_file.name
-    table_name = os.path.splitext(file_name)[0]
+    table_name = (
+        os.path.splitext(file_name)[0]
+        .replace(" ", "_")
+        .replace("-", "_")
+        .replace(".", "_")
+        .lower()
+    )
 
-    if file_name.endswith(".csv"):
-        df = pd.read_csv(uploaded_file)
-    elif file_name.endswith(".xlsx"):
-        df = pd.read_excel(uploaded_file)
-    else:
-        st.warning("⚠️ Only .csv or .xlsx files are supported.")
-        return
+    try:
+        if file_name.endswith(".csv"):
+            df = pd.read_csv(uploaded_file)
+        elif file_name.endswith(".xlsx"):
+            df = pd.read_excel(uploaded_file)
+        else:
+            st.warning("⚠️ Only .csv or .xlsx files are supported.")
+            return
 
-    conn = sqlite3.connect(DB_PATH)
-    df.to_sql(table_name, conn, if_exists="replace", index=False)
-    conn.close()
-    st.success(f"✅ File '{file_name}' added as table '{table_name}'")
+        conn = sqlite3.connect(DB_PATH)
+        df.to_sql(table_name, conn, if_exists="replace", index=False)
+        conn.close()
+        st.success(f"✅ '{file_name}' added as table '{table_name}'")
+    except Exception as e:
+        st.error(f"❌ Failed to add file: {e}")
 
-# Upload placeholder
-with st.sidebar:
-    st.header("📂 Upload New File")
-    uploaded_file = st.file_uploader("Upload CSV or Excel", type=["csv", "xlsx"])
-    if uploaded_file is not None:
+def transcribe_audio(file_path):
+    with open(file_path, "rb") as audio_file:
+        transcript = openai.Audio.transcribe("whisper-1", audio_file)
+    return transcript.get("text", "")
+
+# Upload
+with st.expander("📂 Upload CSV or Excel to add new tables"):
+    uploaded_file = st.file_uploader("Upload .csv or .xlsx", type=["csv", "xlsx"])
+    if uploaded_file:
         add_file_to_db(uploaded_file)
 
-# Connect DB
+# DB
 db = connect_to_db()
-llm = ChatOpenAI(temperature=0, model_name="gpt-4")
-db_chain = SQLDatabaseChain.from_llm(llm=llm, db=db, verbose=True, return_intermediate_steps=True)
+schema_text = get_all_schemas(db)
+schema_display = format_schema_as_text(db)
 
-# Query history
-if "query_history" not in st.session_state:
-    st.session_state.query_history = []
-
-# ================= Schema Explorer ====================
+# Sidebar
 with st.sidebar:
-    st.header("📊 Available Tables")
+    st.header("📊 Table Preview")
     try:
         tables = db.get_usable_table_names()
-        for table in sorted(tables):
-            st.markdown(f"- `{table}`")
-            with sqlite3.connect(DB_PATH) as conn:
-                cols = pd.read_sql_query(f"PRAGMA table_info('{table}')", conn)
-                col_names = cols['name'].tolist()
-                st.caption(f"    Columns: {', '.join(col_names)}")
+        selected_table = st.selectbox("Preview table", sorted(tables))
+        if selected_table:
+            conn = sqlite3.connect(DB_PATH)
+            preview_df = pd.read_sql_query(f"SELECT * FROM {selected_table} LIMIT 5;", conn)
+            st.dataframe(preview_df)
     except Exception as e:
-        st.warning(f"⚠️ Failed to fetch tables: {e}")
+        st.warning(f"⚠️ Table preview failed: {e}")
 
-    st.header("🕘 Query History")
-    for i, q in enumerate(st.session_state.query_history[::-1][:10]):
-        st.markdown(f"{i+1}. {q}")
+    st.markdown("---")
+    st.header("🕓 Query History")
+    if st.session_state.query_history:
+        for q in st.session_state.query_history:
+            st.markdown(f"- {q}")
+        if st.button("🧹 Clear History"):
+            st.session_state.query_history = []
+            st.rerun()
+    else:
+        st.info("No queries yet.")
 
-# ================= Voice Recorder ====================
-col1, col2 = st.columns(2)
+# Schema before input
+st.subheader("📚 Available Tables and Columns")
+st.markdown(schema_display or "No tables yet. Upload one above ☝️")
 
-with col1:
-    st.markdown("### 🔊 Click and Speak your query")
-    custom_html = """
-    <script>
-    let mediaRecorder;
-    let audioChunks = [];
-    let stream;
+# Voice input
+st.subheader("🎤 Speak your question (voice-to-SQL)")
+audio_ctx = webrtc_streamer(key="voice_input", audio_receiver_size=1024, sendback_audio=False)
 
-    async function startRecording() {
-        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        mediaRecorder = new MediaRecorder(stream);
+if audio_ctx.audio_receiver:
+    audio_frames = audio_ctx.audio_receiver.get_frames(timeout=1)
+    if audio_frames:
+        audio_bytes = b"".join([f.to_ndarray().tobytes() for f in audio_frames])
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as f:
+            f.write(audio_bytes)
+            tmp_path = f.name
+        try:
+            transcribed = transcribe_audio(tmp_path)
+            st.session_state.transcribed_text = transcribed
+            st.success(f"🎧 Transcribed: {transcribed}")
+        except Exception as e:
+            st.error(f"Transcription failed: {e}")
 
-        mediaRecorder.ondataavailable = (event) => {
-            if (event.data.size > 0) audioChunks.push(event.data);
-        };
+# Prompt
+prompt = PromptTemplate(
+    input_variables=["schema", "question"],
+    template="""
+You are a SQL expert. Based on the database schema and the user's question, write a correct SQLite SQL query.
 
-        mediaRecorder.onstop = async () => {
-            const audioBlob = new Blob(audioChunks, { type: 'audio/wav' });
-            const arrayBuffer = await audioBlob.arrayBuffer();
-            const base64Audio = btoa(String.fromCharCode(...new Uint8Array(arrayBuffer)));
+Use only the tables and columns provided below.
 
-            window.parent.postMessage({ type: 'audioBase64', data: base64Audio }, '*');
-            audioChunks = [];
-        };
+Schema:
+{schema}
 
-        mediaRecorder.start();
-        document.getElementById('status').innerText = '🎙️ Recording...';
-    }
+User Question:
+{question}
 
-    function stopRecording() {
-        mediaRecorder.stop();
-        stream.getTracks().forEach(track => track.stop());
-        document.getElementById('status').innerText = '✅ Recording stopped';
-    }
-    </script>
-    <button onclick="startRecording()">🎤 Start</button>
-    <button onclick="stopRecording()">⏹️ Stop & Transcribe</button>
-    <p id="status"></p>
-    """
-    st.components.v1.html(custom_html, height=150)
+SQL Query:
+"""
+)
 
-with col2:
-    st.markdown("### ⌨️ Or Type your query")
-    typed_query = st.text_input("Query", placeholder="Type your question here...", label_visibility="collapsed")
-    if typed_query:
-        result = db_chain(typed_query)
-        sql_query = str(result['intermediate_steps'][0])
+llm = ChatOpenAI(temperature=0, model_name="gpt-4")
+chain = LLMChain(llm=llm, prompt=prompt)
 
-        if any(word in sql_query.lower() for word in ["drop", "delete", "update"]):
-            st.error("❌ Dangerous SQL blocked.")
+# Ask question (voice or text)
+st.subheader("🔍 Ask your question")
+text_input = st.text_input("Type your question or use the microphone above", value=st.session_state.transcribed_text)
+
+if text_input:
+    try:
+        st.session_state.query_history.append(text_input)
+        sql_query = chain.run({"schema": schema_text, "question": text_input})
+
+        forbidden = ["drop", "delete", "update", "insert", "alter", "truncate"]
+        if any(f in sql_query.lower() for f in forbidden):
+            st.error("❌ Unsafe SQL command detected.")
         else:
             try:
-                df = pd.read_sql_query(sql_query, sqlite3.connect(DB_PATH))
-                st.session_state.query_history.append(typed_query)
+                conn = sqlite3.connect(DB_PATH)
+                df = pd.read_sql_query(sql_query, conn)
                 st.success("✅ Query executed!")
-                st.code(sql_query)
-                st.dataframe(df)
-                csv = df.to_csv(index=False).encode('utf-8')
-                st.download_button("⬇️ Download CSV", csv, "query_results.csv", "text/csv")
-            except Exception as e:
-                st.error(f"⚠️ Failed to execute query: {e}")
-
-# ================= Transcription Logic ====================
-if "base64_audio" not in st.session_state:
-    st.session_state.base64_audio = ""
-
-def transcribe_audio(base64_audio):
-    audio_bytes = base64.b64decode(base64_audio)
-    response = requests.post(
-        "https://api.openai.com/v1/audio/transcriptions",
-        headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-        files={"file": ("audio.wav", audio_bytes, "audio/wav")},
-        data={"model": "whisper-1"}
-    )
-    return response.json().get("text", "")
-
-# JS listener
-st.components.v1.html("""
-<script>
-window.addEventListener("message", (event) => {
-    if (event.data.type === 'audioBase64') {
-        const audio = event.data.data;
-        const queryParams = new URLSearchParams(window.location.search);
-        queryParams.set("audio", audio);
-        window.location.search = queryParams.toString();
-    }
-});
-</script>
-""", height=0)
-
-# Handle audio transcription
-audio_base64 = st.query_params.get("audio")
-if audio_base64:
-    transcription = transcribe_audio(audio_base64[0])
-    st.text_area("📝 Whisper Transcript", transcription)
-
-    if transcription:
-        result = db_chain(transcription)
-        sql_query = str(result['intermediate_steps'][0])
-
-        if any(word in sql_query.lower() for word in ["drop", "delete", "update"]):
-            st.error("❌ Dangerous SQL blocked.")
-        else:
-            try:
-                df = pd.read_sql_query(sql_query, sqlite3.connect(DB_PATH))
-                st.session_state.query_history.append(transcription)
-                st.success("✅ Query executed!")
-                st.code(sql_query)
-                st.dataframe(df)
-                csv = df.to_csv(index=False).encode('utf-8')
-                st.download_button("⬇️ Download CSV", csv, "query_results.csv", "text/csv")
-            except Exception as e:
-                st.error(f"⚠️ Failed to execute query: {e}")
-else:
-    st.info("🎤 Speak and click 'Stop & Transcribe' to query.")
+                st.dataframe(df, use_container_width=True)
+                csv = df.to_csv(index=False).encode("utf-8")
+                st.download_button("📥 Download results as CSV", csv, "query_results.csv", "text/csv")
+            except Exception:
+                st.warning("⚠️ SQL ran but no data was returned.")
+            st.markdown("**Generated SQL:**")
+            st.code(sql_query, language="sql")
+    except Exception as e:
+        st.error(f"❌ Error:\n\n{e}")
