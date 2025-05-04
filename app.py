@@ -10,7 +10,10 @@ from langchain_community.utilities.sql_database import SQLDatabase
 import openai
 from datetime import datetime
 import av
+import numpy as np
 from streamlit_webrtc import webrtc_streamer, WebRtcMode, AudioProcessorBase
+from pydub import AudioSegment
+import io
 
 # Set page config
 st.set_page_config(page_title="Voice SQL Agent", layout="wide", page_icon="🗣️")
@@ -23,6 +26,10 @@ if "transcribed_text" not in st.session_state:
     st.session_state.transcribed_text = ""
 if "recording" not in st.session_state:
     st.session_state.recording = False
+if "audio_frames" not in st.session_state:
+    st.session_state.audio_frames = []
+if "processing" not in st.session_state:
+    st.session_state.processing = False
 
 # Environment setup
 openai.api_key = os.getenv("OPENAI_API_KEY")
@@ -95,10 +102,28 @@ def add_file_to_db(uploaded_file):
     except Exception as e:
         st.error(f"❌ Failed to add file: {e}")
 
-def transcribe_audio(file_path):
-    with open(file_path, "rb") as audio_file:
-        transcript = openai.Audio.transcribe("whisper-1", audio_file)
-    return transcript.get("text", "")
+def transcribe_audio(audio_frames):
+    try:
+        # Convert frames to audio file
+        audio_array = np.concatenate(audio_frames)
+        audio_segment = AudioSegment(
+            audio_array.tobytes(),
+            frame_rate=44100,
+            sample_width=audio_array.dtype.itemsize,
+            channels=1
+        )
+        
+        # Export to bytes
+        audio_bytes = io.BytesIO()
+        audio_segment.export(audio_bytes, format="wav")
+        audio_bytes.seek(0)
+        
+        # Transcribe using Whisper
+        transcript = openai.Audio.transcribe("whisper-1", audio_bytes)
+        return transcript.get("text", "")
+    except Exception as e:
+        st.error(f"Transcription failed: {str(e)}")
+        return ""
 
 def process_question(question, db):
     """Process the user question and execute SQL query"""
@@ -191,14 +216,16 @@ with col1:
         # Recording controls
         col1, col2 = st.columns(2)
         with col1:
-            if st.button("🎤 Start Recording", disabled=st.session_state.recording):
+            if st.button("🎤 Start Recording", disabled=st.session_state.recording or st.session_state.processing):
                 st.session_state.recording = True
                 st.session_state.audio_frames = []
+                st.session_state.transcribed_text = ""
                 st.success("Recording started... Speak now!")
         with col2:
-            if st.button("⏹️ Stop Recording", disabled=not st.session_state.recording):
+            if st.button("⏹️ Stop Recording", disabled=not st.session_state.recording or st.session_state.processing):
                 st.session_state.recording = False
-                st.info("Recording stopped. Processing...")
+                st.session_state.processing = True
+                st.info("Processing your recording...")
         
         # Audio recorder
         webrtc_ctx = webrtc_streamer(
@@ -209,23 +236,22 @@ with col1:
             media_stream_constraints={"audio": True, "video": False},
         )
         
-        if webrtc_ctx.audio_processor and not st.session_state.recording and hasattr(webrtc_ctx.audio_processor, 'frames'):
+        # Process audio when recording stops
+        if (not st.session_state.recording and 
+            st.session_state.processing and 
+            webrtc_ctx.audio_processor and 
+            hasattr(webrtc_ctx.audio_processor, 'frames') and 
+            webrtc_ctx.audio_processor.frames):
+            
             audio_frames = webrtc_ctx.audio_processor.frames
             if audio_frames:
-                try:
-                    # Save audio to temp file
-                    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
-                        tmp_path = tmp_file.name
-                        # This would need proper audio file writing logic for the frames
-                        # For demo purposes, we'll just simulate it
-                    
-                    # Simulate transcription (replace with actual implementation)
-                    # transcribed = transcribe_audio(tmp_path)
-                    transcribed = "Simulated transcription of your voice input"
-                    st.session_state.transcribed_text = transcribed
+                transcribed = transcribe_audio(audio_frames)
+                st.session_state.transcribed_text = transcribed
+                st.session_state.processing = False
+                if transcribed:
                     st.success(f"🔊 Transcribed: {transcribed}")
-                except Exception as e:
-                    st.error(f"Transcription failed: {e}")
+                else:
+                    st.warning("No speech detected or transcription failed")
         
         # Text input with voice transcription
         question = st.text_input(
@@ -235,7 +261,7 @@ with col1:
         )
         
         # Process question
-        if st.button("🔍 Run Query") and question:
+        if st.button("🔍 Run Query", disabled=st.session_state.processing) and question:
             process_question(question, db)
 
 with col2:
