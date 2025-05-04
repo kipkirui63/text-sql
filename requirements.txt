@@ -10,3 +10,4 @@ sqlalchemy
 pandas
 openpyxl
 av
+ffmpeg
