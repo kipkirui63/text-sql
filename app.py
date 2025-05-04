@@ -28,7 +28,7 @@ if "recording" not in st.session_state:
 openai.api_key = os.getenv("OPENAI_API_KEY")
 DB_PATH = "my_database.db"
 
-# Custom Audio Processor for better handling
+# Custom Audio Processor
 class AudioRecorder(AudioProcessorBase):
     def __init__(self):
         self.frames = []
@@ -100,7 +100,66 @@ def transcribe_audio(file_path):
         transcript = openai.Audio.transcribe("whisper-1", audio_file)
     return transcript.get("text", "")
 
-# UI Layout
+def process_question(question, db):
+    """Process the user question and execute SQL query"""
+    schema_text = get_all_schemas(db)
+    
+    # Initialize LLM chain
+    prompt = PromptTemplate(
+        input_variables=["schema", "question"],
+        template="""
+        You are a SQL expert. Based on the database schema and the user's question, 
+        write a correct SQLite SQL query. Use only the tables and columns provided.
+
+        Schema:
+        {schema}
+
+        User Question:
+        {question}
+
+        SQL Query:
+        """
+    )
+    
+    llm = ChatOpenAI(temperature=0, model_name="gpt-4")
+    chain = LLMChain(llm=llm, prompt=prompt)
+    
+    try:
+        st.session_state.query_history.append(question)
+        sql_query = chain.run({"schema": schema_text, "question": question})
+
+        # Safety check
+        forbidden = ["drop", "delete", "update", "insert", "alter", "truncate"]
+        if any(f in sql_query.lower() for f in forbidden):
+            st.error("❌ Unsafe SQL command detected.")
+        else:
+            try:
+                conn = sqlite3.connect(DB_PATH)
+                df = pd.read_sql_query(sql_query, conn)
+                
+                st.success("✅ Query executed successfully!")
+                
+                # Display results
+                st.dataframe(df, use_container_width=True, height=400)
+                
+                # Download option
+                csv = df.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    "📥 Download as CSV", 
+                    csv, 
+                    f"query_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", 
+                    "text/csv"
+                )
+                
+                # Show generated SQL
+                with st.expander("🔍 View Generated SQL"):
+                    st.code(sql_query, language="sql")
+            except Exception as e:
+                st.warning(f"⚠️ SQL ran but no data was returned: {e}")
+    except Exception as e:
+        st.error(f"❌ Error processing your question:\n\n{e}")
+
+# Main UI Layout
 col1, col2 = st.columns([3, 1])
 
 with col1:
@@ -194,72 +253,13 @@ with col2:
     st.markdown("---")
     st.header("🕒 Query History")
     if st.session_state.query_history:
-        for i, q in enumerate(st.session_state.query_history[-5:][::-1]):
+        for i, q in enumerate(reversed(st.session_state.query_history[-5:])):
             st.markdown(f"{len(st.session_state.query_history)-i}. {q[:50]}...")
         if st.button("Clear History"):
             st.session_state.query_history = []
             st.rerun()
     else:
         st.info("No queries yet.")
-
-def process_question(question, db):
-    """Process the user question and execute SQL query"""
-    schema_text = get_all_schemas(db)
-    
-    # Initialize LLM chain
-    prompt = PromptTemplate(
-        input_variables=["schema", "question"],
-        template="""
-        You are a SQL expert. Based on the database schema and the user's question, 
-        write a correct SQLite SQL query. Use only the tables and columns provided.
-
-        Schema:
-        {schema}
-
-        User Question:
-        {question}
-
-        SQL Query:
-        """
-    )
-    
-    llm = ChatOpenAI(temperature=0, model_name="gpt-4")
-    chain = LLMChain(llm=llm, prompt=prompt)
-    
-    try:
-        st.session_state.query_history.append(question)
-        sql_query = chain.run({"schema": schema_text, "question": question})
-
-        # Safety check
-        forbidden = ["drop", "delete", "update", "insert", "alter", "truncate"]
-        if any(f in sql_query.lower() for f in forbidden):
-            st.error("❌ Unsafe SQL command detected.")
-        else:
-            try:
-                conn = sqlite3.connect(DB_PATH)
-                df = pd.read_sql_query(sql_query, conn)
-                
-                st.success("✅ Query executed successfully!")
-                
-                # Display results
-                st.dataframe(df, use_container_width=True, height=400)
-                
-                # Download option
-                csv = df.to_csv(index=False).encode("utf-8")
-                st.download_button(
-                    "📥 Download as CSV", 
-                    csv, 
-                    f"query_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", 
-                    "text/csv"
-                )
-                
-                # Show generated SQL
-                with st.expander("🔍 View Generated SQL"):
-                    st.code(sql_query, language="sql")
-            except Exception as e:
-                st.warning(f"⚠️ SQL ran but no data was returned: {e}")
-    except Exception as e:
-        st.error(f"❌ Error processing your question:\n\n{e}")
 
 # Add some styling
 st.markdown("""
