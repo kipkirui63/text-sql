@@ -14,6 +14,7 @@ import numpy as np
 from streamlit_webrtc import webrtc_streamer, WebRtcMode, AudioProcessorBase
 from pydub import AudioSegment
 import io
+import queue
 
 # Set page config
 st.set_page_config(page_title="Voice SQL Agent", layout="wide", page_icon="🗣️")
@@ -26,10 +27,10 @@ if "transcribed_text" not in st.session_state:
     st.session_state.transcribed_text = ""
 if "recording" not in st.session_state:
     st.session_state.recording = False
-if "audio_frames" not in st.session_state:
-    st.session_state.audio_frames = []
 if "processing" not in st.session_state:
     st.session_state.processing = False
+if "audio_buffer" not in st.session_state:
+    st.session_state.audio_buffer = queue.Queue()
 
 # Environment setup
 openai.api_key = os.getenv("OPENAI_API_KEY")
@@ -37,13 +38,46 @@ DB_PATH = "my_database.db"
 
 # Custom Audio Processor
 class AudioRecorder(AudioProcessorBase):
-    def __init__(self):
-        self.frames = []
-        
     def recv(self, frame: av.AudioFrame) -> av.AudioFrame:
         if st.session_state.recording:
-            self.frames.append(frame.to_ndarray())
+            st.session_state.audio_buffer.put(frame.to_ndarray())
         return frame
+
+def process_audio_frames():
+    """Process all audio frames in the buffer"""
+    frames = []
+    while not st.session_state.audio_buffer.empty():
+        frames.append(st.session_state.audio_buffer.get())
+    
+    if not frames:
+        return None
+    
+    # Convert frames to single numpy array
+    audio_array = np.concatenate(frames)
+    
+    # Convert to AudioSegment
+    audio_segment = AudioSegment(
+        audio_array.tobytes(),
+        frame_rate=44100,
+        sample_width=audio_array.dtype.itemsize,
+        channels=1
+    )
+    
+    # Export to bytes
+    audio_bytes = io.BytesIO()
+    audio_segment.export(audio_bytes, format="wav")
+    audio_bytes.seek(0)
+    
+    return audio_bytes
+
+def transcribe_audio(audio_bytes):
+    """Transcribe audio using Whisper API"""
+    try:
+        transcript = openai.Audio.transcribe("whisper-1", audio_bytes)
+        return transcript.get("text", "")
+    except Exception as e:
+        st.error(f"Transcription failed: {str(e)}")
+        return ""
 
 # Database functions
 def connect_to_db():
@@ -102,34 +136,10 @@ def add_file_to_db(uploaded_file):
     except Exception as e:
         st.error(f"❌ Failed to add file: {e}")
 
-def transcribe_audio(audio_frames):
-    try:
-        # Convert frames to audio file
-        audio_array = np.concatenate(audio_frames)
-        audio_segment = AudioSegment(
-            audio_array.tobytes(),
-            frame_rate=44100,
-            sample_width=audio_array.dtype.itemsize,
-            channels=1
-        )
-        
-        # Export to bytes
-        audio_bytes = io.BytesIO()
-        audio_segment.export(audio_bytes, format="wav")
-        audio_bytes.seek(0)
-        
-        # Transcribe using Whisper
-        transcript = openai.Audio.transcribe("whisper-1", audio_bytes)
-        return transcript.get("text", "")
-    except Exception as e:
-        st.error(f"Transcription failed: {str(e)}")
-        return ""
-
 def process_question(question, db):
     """Process the user question and execute SQL query"""
     schema_text = get_all_schemas(db)
     
-    # Initialize LLM chain
     prompt = PromptTemplate(
         input_variables=["schema", "question"],
         template="""
@@ -153,7 +163,6 @@ def process_question(question, db):
         st.session_state.query_history.append(question)
         sql_query = chain.run({"schema": schema_text, "question": question})
 
-        # Safety check
         forbidden = ["drop", "delete", "update", "insert", "alter", "truncate"]
         if any(f in sql_query.lower() for f in forbidden):
             st.error("❌ Unsafe SQL command detected.")
@@ -163,11 +172,8 @@ def process_question(question, db):
                 df = pd.read_sql_query(sql_query, conn)
                 
                 st.success("✅ Query executed successfully!")
-                
-                # Display results
                 st.dataframe(df, use_container_width=True, height=400)
                 
-                # Download option
                 csv = df.to_csv(index=False).encode("utf-8")
                 st.download_button(
                     "📥 Download as CSV", 
@@ -176,7 +182,6 @@ def process_question(question, db):
                     "text/csv"
                 )
                 
-                # Show generated SQL
                 with st.expander("🔍 View Generated SQL"):
                     st.code(sql_query, language="sql")
             except Exception as e:
@@ -190,20 +195,17 @@ col1, col2 = st.columns([3, 1])
 with col1:
     st.header("Database Interaction")
     
-    # Upload section
     with st.expander("📤 Upload Data", expanded=True):
         uploaded_file = st.file_uploader("Upload CSV or Excel file", type=["csv", "xlsx"])
         if uploaded_file:
             add_file_to_db(uploaded_file)
     
-    # Schema display
     db = connect_to_db()
     schema_display = format_schema_as_text(db)
     
     with st.expander("📊 Database Schema", expanded=True):
         st.markdown(schema_display or "No tables yet. Upload one above ☝️")
     
-    # Voice input section
     with st.expander("🎤 Voice Input", expanded=True):
         st.markdown("""
         **How to use:**
@@ -218,7 +220,7 @@ with col1:
         with col1:
             if st.button("🎤 Start Recording", disabled=st.session_state.recording or st.session_state.processing):
                 st.session_state.recording = True
-                st.session_state.audio_frames = []
+                st.session_state.audio_buffer = queue.Queue()
                 st.session_state.transcribed_text = ""
                 st.success("Recording started... Speak now!")
         with col2:
@@ -226,8 +228,22 @@ with col1:
                 st.session_state.recording = False
                 st.session_state.processing = True
                 st.info("Processing your recording...")
+                
+                # Process audio immediately when stopping
+                audio_bytes = process_audio_frames()
+                if audio_bytes:
+                    transcribed = transcribe_audio(audio_bytes)
+                    st.session_state.transcribed_text = transcribed
+                    st.session_state.processing = False
+                    if transcribed:
+                        st.success(f"🔊 Transcribed: {transcribed}")
+                    else:
+                        st.warning("No speech detected or transcription failed")
+                else:
+                    st.session_state.processing = False
+                    st.warning("No audio recorded")
         
-        # Audio recorder
+        # Audio recorder - runs continuously
         webrtc_ctx = webrtc_streamer(
             key="voice-input",
             mode=WebRtcMode.SENDONLY,
@@ -236,23 +252,6 @@ with col1:
             media_stream_constraints={"audio": True, "video": False},
         )
         
-        # Process audio when recording stops
-        if (not st.session_state.recording and 
-            st.session_state.processing and 
-            webrtc_ctx.audio_processor and 
-            hasattr(webrtc_ctx.audio_processor, 'frames') and 
-            webrtc_ctx.audio_processor.frames):
-            
-            audio_frames = webrtc_ctx.audio_processor.frames
-            if audio_frames:
-                transcribed = transcribe_audio(audio_frames)
-                st.session_state.transcribed_text = transcribed
-                st.session_state.processing = False
-                if transcribed:
-                    st.success(f"🔊 Transcribed: {transcribed}")
-                else:
-                    st.warning("No speech detected or transcription failed")
-        
         # Text input with voice transcription
         question = st.text_input(
             "Or type your question here", 
@@ -260,7 +259,6 @@ with col1:
             placeholder="Type or speak your question about the data"
         )
         
-        # Process question
         if st.button("🔍 Run Query", disabled=st.session_state.processing) and question:
             process_question(question, db)
 
