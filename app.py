@@ -1,3 +1,4 @@
+# app.py
 import os
 import sqlite3
 import tempfile
@@ -31,6 +32,10 @@ except:
     """)
     st.session_state.ffmpeg_available = False
 
+# Create a persistent upload folder
+UPLOAD_DIR = "uploaded_files"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
 # Initialize session state
 if "query_history" not in st.session_state:
     st.session_state.query_history = []
@@ -55,14 +60,9 @@ class AudioRecorder(AudioProcessorBase):
         return frame
 
 def save_audio_to_tempfile(audio_frames):
-    """Save audio frames to a temporary WAV file"""
     try:
-        # Convert frames to single numpy array
         audio_array = np.concatenate(audio_frames)
-        
-        # Create temporary file
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
-            # Simple WAV file header (44 bytes) + audio data
             tmp_file.write(b'RIFF\x00\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00\x80\xbb\x00\x00\x00\x77\x01\x00\x02\x00\x10\x00data\x00\x00\x00\x00')
             tmp_file.write(audio_array.tobytes())
             return tmp_file.name
@@ -71,7 +71,6 @@ def save_audio_to_tempfile(audio_frames):
         return None
 
 def transcribe_audio(file_path):
-    """Transcribe audio using Whisper API"""
     try:
         with open(file_path, "rb") as audio_file:
             transcript = openai.Audio.transcribe("whisper-1", audio_file)
@@ -119,12 +118,15 @@ def add_file_to_db(uploaded_file):
         .replace(".", "_")
         .lower()
     )
+    save_path = os.path.join(UPLOAD_DIR, file_name)
+    with open(save_path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
 
     try:
         if file_name.endswith(".csv"):
-            df = pd.read_csv(uploaded_file)
+            df = pd.read_csv(save_path)
         elif file_name.endswith(".xlsx"):
-            df = pd.read_excel(uploaded_file)
+            df = pd.read_excel(save_path)
         else:
             st.warning("⚠️ Only .csv or .xlsx files are supported.")
             return
@@ -138,9 +140,7 @@ def add_file_to_db(uploaded_file):
         st.error(f"❌ Failed to add file: {e}")
 
 def process_question(question, db):
-    """Process the user question and execute SQL query"""
     schema_text = get_all_schemas(db)
-    
     prompt = PromptTemplate(
         input_variables=["schema", "question"],
         template="""
@@ -156,14 +156,11 @@ def process_question(question, db):
         SQL Query:
         """
     )
-    
     llm = ChatOpenAI(temperature=0, model_name="gpt-4")
     chain = LLMChain(llm=llm, prompt=prompt)
-    
     try:
         st.session_state.query_history.append(question)
         sql_query = chain.run({"schema": schema_text, "question": question})
-
         forbidden = ["drop", "delete", "update", "insert", "alter", "truncate"]
         if any(f in sql_query.lower() for f in forbidden):
             st.error("❌ Unsafe SQL command detected.")
@@ -171,18 +168,10 @@ def process_question(question, db):
             try:
                 conn = sqlite3.connect(DB_PATH)
                 df = pd.read_sql_query(sql_query, conn)
-                
                 st.success("✅ Query executed successfully!")
                 st.dataframe(df, use_container_width=True, height=400)
-                
                 csv = df.to_csv(index=False).encode("utf-8")
-                st.download_button(
-                    "📥 Download as CSV", 
-                    csv, 
-                    f"query_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", 
-                    "text/csv"
-                )
-                
+                st.download_button("📥 Download as CSV", csv, f"query_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", "text/csv")
                 with st.expander("🔍 View Generated SQL"):
                     st.code(sql_query, language="sql")
             except Exception as e:
@@ -195,18 +184,16 @@ col1, col2 = st.columns([3, 1])
 
 with col1:
     st.header("Database Interaction")
-    
     with st.expander("📤 Upload Data", expanded=True):
         uploaded_file = st.file_uploader("Upload CSV or Excel file", type=["csv", "xlsx"])
         if uploaded_file:
             add_file_to_db(uploaded_file)
-    
+
     db = connect_to_db()
     schema_display = format_schema_as_text(db)
-    
     with st.expander("📊 Database Schema", expanded=True):
         st.markdown(schema_display or "No tables yet. Upload one above ☝️")
-    
+
     if st.session_state.ffmpeg_available:
         with st.expander("🎤 Voice Input", expanded=True):
             st.markdown("""
@@ -216,8 +203,6 @@ with col1:
             3. Click 'Stop Recording' when done
             4. Wait for transcription to appear
             """)
-            
-            # Recording controls
             col1, col2 = st.columns(2)
             with col1:
                 if st.button("🎤 Start Recording", disabled=st.session_state.recording or st.session_state.processing):
@@ -230,20 +215,14 @@ with col1:
                     st.session_state.recording = False
                     st.session_state.processing = True
                     st.info("Processing your recording...")
-                    
-                    # Get all audio frames
                     audio_frames = []
                     while not st.session_state.audio_buffer.empty():
                         audio_frames.append(st.session_state.audio_buffer.get())
-                    
                     if audio_frames:
-                        # Save to temporary file
                         audio_file = save_audio_to_tempfile(audio_frames)
                         if audio_file:
-                            # Transcribe
                             transcribed = transcribe_audio(audio_file)
-                            os.unlink(audio_file)  # Clean up
-                            
+                            os.unlink(audio_file)
                             if transcribed:
                                 st.session_state.transcribed_text = transcribed
                                 st.success(f"🔊 Transcribed: {transcribed}")
@@ -251,11 +230,8 @@ with col1:
                                 st.warning("No speech detected in recording")
                     else:
                         st.warning("No audio was recorded")
-                    
                     st.session_state.processing = False
-            
-            # Audio recorder
-            webrtc_ctx = webrtc_streamer(
+            webrtc_streamer(
                 key="voice-input",
                 mode=WebRtcMode.SENDONLY,
                 audio_processor_factory=AudioRecorder,
@@ -264,14 +240,8 @@ with col1:
             )
     else:
         st.warning("Voice input disabled - FFmpeg not installed")
-    
-    # Text input with voice transcription
-    question = st.text_input(
-        "Enter your question", 
-        value=st.session_state.transcribed_text,
-        placeholder="Type or speak your question about the data"
-    )
-    
+
+    question = st.text_input("Enter your question", value=st.session_state.transcribed_text, placeholder="Type or speak your question about the data")
     if st.button("🔍 Run Query", disabled=st.session_state.processing) and question:
         process_question(question, db)
 
@@ -286,7 +256,7 @@ with col2:
             st.dataframe(preview_df, height=300)
     except Exception as e:
         st.warning(f"⚠️ Table preview failed: {e}")
-    
+
     st.markdown("---")
     st.header("🕒 Query History")
     if st.session_state.query_history:
