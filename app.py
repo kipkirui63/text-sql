@@ -1,18 +1,16 @@
 import os
 import sqlite3
-import tempfile
 import pandas as pd
 import streamlit as st
 from langchain.prompts import PromptTemplate
 from langchain_openai import ChatOpenAI
 from langchain.chains import LLMChain
 from langchain_community.utilities.sql_database import SQLDatabase
-import openai
 from datetime import datetime
 
 # Set page config
-st.set_page_config(page_title="SQL Agent", layout="wide", page_icon="🗣️")
-st.title("Text to SQL Query Agent")
+st.set_page_config(page_title="SQL Query Agent", layout="wide", page_icon="🔍")
+st.title("🔍 SQL Query Agent")
 
 # Initialize session state
 if "query_history" not in st.session_state:
@@ -23,8 +21,13 @@ openai.api_key = os.getenv("OPENAI_API_KEY")
 DB_PATH = "my_database.db"
 
 # Database functions
+@st.cache_data
 def connect_to_db():
-    return SQLDatabase.from_uri(f"sqlite:///{DB_PATH}")
+    try:
+        return SQLDatabase.from_uri(f"sqlite:///{DB_PATH}")
+    except Exception as e:
+        st.error(f"Failed to connect to database: {e}")
+        st.stop()
 
 def get_all_schemas(db) -> str:
     schema_str = ""
@@ -49,7 +52,8 @@ def format_schema_as_text(db) -> str:
                 output += f"- `{row['name']}` ({row['type']})\n"
             output += "\n"
         return output
-    except:
+    except Exception as e:
+        st.error(f"Error loading schema: {e}")
         return ""
 
 def add_file_to_db(uploaded_file):
@@ -75,7 +79,6 @@ def add_file_to_db(uploaded_file):
         df.to_sql(table_name, conn, if_exists="replace", index=False)
         conn.close()
         st.success(f"✅ '{file_name}' added as table '{table_name}'")
-        st.rerun()
     except Exception as e:
         st.error(f"❌ Failed to add file: {e}")
 
@@ -155,8 +158,11 @@ with col1:
             placeholder="Type your question about the data"
         )
         
-        if st.button("🔍 Run Query") and question:
-            process_question(question, db)
+        if st.button("🔍 Run Query"):
+            if question and question.strip():
+                process_question(question.strip(), db)
+            else:
+                st.warning("Please enter a question")
 
 with col2:
     st.header("Database Preview")
@@ -177,7 +183,6 @@ with col2:
             st.markdown(f"{len(st.session_state.query_history)-i}. {q[:50]}...")
         if st.button("Clear History"):
             st.session_state.query_history = []
-            st.rerun()
     else:
         st.info("No queries yet.")
 
@@ -194,6 +199,9 @@ st.markdown("""
         border: 1px solid #e1e4e8;
         border-radius: 8px;
         padding: 10px;
+    }
+    .stTextInput input {
+        font-size: 16px;
     }
 </style>
 """, unsafe_allow_html=True)
