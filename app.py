@@ -9,75 +9,18 @@ from langchain.chains import LLMChain
 from langchain_community.utilities.sql_database import SQLDatabase
 import openai
 from datetime import datetime
-import av
-import numpy as np
-from streamlit_webrtc import webrtc_streamer, WebRtcMode, AudioProcessorBase
-from pydub import AudioSegment
-import io
-import queue
 
 # Set page config
-st.set_page_config(page_title="Voice SQL Agent", layout="wide", page_icon="🗣️")
-st.title("🗣️ Voice-to-SQL Agent")
+st.set_page_config(page_title="SQL Agent", layout="wide", page_icon="🗣️")
+st.title("SQL Query Agent")
 
 # Initialize session state
 if "query_history" not in st.session_state:
     st.session_state.query_history = []
-if "transcribed_text" not in st.session_state:
-    st.session_state.transcribed_text = ""
-if "recording" not in st.session_state:
-    st.session_state.recording = False
-if "processing" not in st.session_state:
-    st.session_state.processing = False
-if "audio_buffer" not in st.session_state:
-    st.session_state.audio_buffer = queue.Queue()
 
 # Environment setup
 openai.api_key = os.getenv("OPENAI_API_KEY")
 DB_PATH = "my_database.db"
-
-# Custom Audio Processor
-class AudioRecorder(AudioProcessorBase):
-    def recv(self, frame: av.AudioFrame) -> av.AudioFrame:
-        if st.session_state.recording:
-            st.session_state.audio_buffer.put(frame.to_ndarray())
-        return frame
-
-def process_audio_frames():
-    """Process all audio frames in the buffer"""
-    frames = []
-    while not st.session_state.audio_buffer.empty():
-        frames.append(st.session_state.audio_buffer.get())
-    
-    if not frames:
-        return None
-    
-    # Convert frames to single numpy array
-    audio_array = np.concatenate(frames)
-    
-    # Convert to AudioSegment
-    audio_segment = AudioSegment(
-        audio_array.tobytes(),
-        frame_rate=44100,
-        sample_width=audio_array.dtype.itemsize,
-        channels=1
-    )
-    
-    # Export to bytes
-    audio_bytes = io.BytesIO()
-    audio_segment.export(audio_bytes, format="wav")
-    audio_bytes.seek(0)
-    
-    return audio_bytes
-
-def transcribe_audio(audio_bytes):
-    """Transcribe audio using Whisper API"""
-    try:
-        transcript = openai.Audio.transcribe("whisper-1", audio_bytes)
-        return transcript.get("text", "")
-    except Exception as e:
-        st.error(f"Transcription failed: {str(e)}")
-        return ""
 
 # Database functions
 def connect_to_db():
@@ -206,60 +149,13 @@ with col1:
     with st.expander("📊 Database Schema", expanded=True):
         st.markdown(schema_display or "No tables yet. Upload one above ☝️")
     
-    with st.expander("🎤 Voice Input", expanded=True):
-        st.markdown("""
-        **How to use:**
-        1. Click 'Start Recording' below
-        2. Ask your question clearly
-        3. Click 'Stop Recording' when done
-        4. Your speech will be transcribed automatically
-        """)
-        
-        # Recording controls
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("🎤 Start Recording", disabled=st.session_state.recording or st.session_state.processing):
-                st.session_state.recording = True
-                st.session_state.audio_buffer = queue.Queue()
-                st.session_state.transcribed_text = ""
-                st.success("Recording started... Speak now!")
-        with col2:
-            if st.button("⏹️ Stop Recording", disabled=not st.session_state.recording or st.session_state.processing):
-                st.session_state.recording = False
-                st.session_state.processing = True
-                st.info("Processing your recording...")
-                
-                # Process audio immediately when stopping
-                audio_bytes = process_audio_frames()
-                if audio_bytes:
-                    transcribed = transcribe_audio(audio_bytes)
-                    st.session_state.transcribed_text = transcribed
-                    st.session_state.processing = False
-                    if transcribed:
-                        st.success(f"🔊 Transcribed: {transcribed}")
-                    else:
-                        st.warning("No speech detected or transcription failed")
-                else:
-                    st.session_state.processing = False
-                    st.warning("No audio recorded")
-        
-        # Audio recorder - runs continuously
-        webrtc_ctx = webrtc_streamer(
-            key="voice-input",
-            mode=WebRtcMode.SENDONLY,
-            audio_processor_factory=AudioRecorder,
-            rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
-            media_stream_constraints={"audio": True, "video": False},
-        )
-        
-        # Text input with voice transcription
+    with st.expander("📝 Query Input", expanded=True):
         question = st.text_input(
-            "Or type your question here", 
-            value=st.session_state.transcribed_text,
-            placeholder="Type or speak your question about the data"
+            "Type your question here", 
+            placeholder="Type your question about the data"
         )
         
-        if st.button("🔍 Run Query", disabled=st.session_state.processing) and question:
+        if st.button("🔍 Run Query") and question:
             process_question(question, db)
 
 with col2:
