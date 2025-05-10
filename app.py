@@ -9,14 +9,12 @@ from langchain_community.utilities.sql_database import SQLDatabase
 from datetime import datetime
 import hashlib
 from dotenv import load_dotenv
-from langchain.memory import ConversationBufferMemory
-from langchain_community.chat_message_histories import StreamlitChatMessageHistory
 
 # Load environment variables
 load_dotenv()
 
 # Set page config
-st.set_page_config(page_title="Natural SQL Query Assistant", layout="wide", page_icon="🔍")
+st.set_page_config(page_title="SQL Query Agent", layout="wide", page_icon="🔍")
 
 # Initialize databases
 def init_db():
@@ -106,14 +104,11 @@ def auth_page():
 
 # Main App
 def main_app():
-    st.title("💬 Natural SQL Query Assistant")
+    st.title("🔍 SQL Query Agent")
 
     # Initialize session state
     if "query_history" not in st.session_state:
         st.session_state.query_history = []
-    
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = []
     
     # Environment setup
     try:
@@ -189,66 +184,24 @@ def main_app():
         except Exception as e:
             st.error(f"❌ Failed to add file: {e}")
 
-    def get_sample_data(table_name, limit=5):
-        """Get sample data from a table"""
-        conn = sqlite3.connect(DB_PATH)
-        df = pd.read_sql_query(f"SELECT * FROM {table_name} LIMIT {limit};", conn)
-        conn.close()
-        return df
-    
-    def get_table_info(db):
-        """Get detailed information about all tables"""
-        table_info = {}
-        for table in db.get_usable_table_names():
-            conn = sqlite3.connect(DB_PATH)
-            # Get schema
-            schema = pd.read_sql_query(f"PRAGMA table_info({table});", conn)
-            # Get row count
-            row_count = pd.read_sql_query(f"SELECT COUNT(*) as count FROM {table}", conn)["count"][0]
-            # Get sample data
-            sample = get_sample_data(table)
-            
-            table_info[table] = {
-                "schema": schema,
-                "row_count": row_count,
-                "sample": sample
-            }
-            conn.close()
-        return table_info
-
-    def process_question(question, db, with_context=True):
-        """Process the user question and execute SQL query with context awareness"""
+    def process_question(question, db):
+        """Process the user question and execute SQL query"""
         schema_text = get_all_schemas(db)
         
-        # Template for SQL generation
-        sql_template = """
-        You are a SQL expert. Based on the database schema and the user's question, 
-        write a correct SQLite SQL query. Use only the tables and columns provided.
-        
-        Schema:
-        {schema}
-        
-        {context}
-        
-        User Question:
-        {question}
-        
-        SQL Query (ONLY return the SQL query without any explanation or markdown):
-        """
-        
-        # Add context from conversation history if available
-        context = ""
-        if with_context and st.session_state.chat_history:
-            context = "Previous conversation context:\n"
-            # Include only the last 5 exchanges for context
-            for i in range(max(0, len(st.session_state.chat_history) - 5), len(st.session_state.chat_history)):
-                context += f"Q: {st.session_state.chat_history[i][0]}\n"
-                if st.session_state.chat_history[i][1]:
-                    context += f"Response: {st.session_state.chat_history[i][1]}\n"
-        
         prompt = PromptTemplate(
-            input_variables=["schema", "context", "question"],
-            template=sql_template
+            input_variables=["schema", "question"],
+            template="""
+            You are a SQL expert. Based on the database schema and the user's question, 
+            write a correct SQLite SQL query. Use only the tables and columns provided.
+
+            Schema:
+            {schema}
+
+            User Question:
+            {question}
+
+            SQL Query:
+            """
         )
         
         llm = ChatOpenAI(temperature=0, model_name="gpt-4", openai_api_key=openai_api_key)
@@ -256,231 +209,84 @@ def main_app():
         
         try:
             st.session_state.query_history.append(question)
-            sql_query = chain.run({"schema": schema_text, "context": context, "question": question})
-            
-            # Clean up the SQL query (in case the LLM includes explanations or formatting)
-            sql_query = sql_query.strip()
-            if sql_query.startswith("```sql"):
-                sql_query = sql_query.split("```sql")[1]
-            if sql_query.endswith("```"):
-                sql_query = sql_query.split("```")[0]
-            sql_query = sql_query.strip()
-            
+            sql_query = chain.run({"schema": schema_text, "question": question})
+
             forbidden = ["drop", "delete", "update", "insert", "alter", "truncate"]
             if any(f in sql_query.lower() for f in forbidden):
                 st.error("❌ Unsafe SQL command detected.")
-                return None, None
             else:
                 try:
                     conn = sqlite3.connect(DB_PATH)
                     df = pd.read_sql_query(sql_query, conn)
                     
-                    # Generate a natural language explanation of the result
-                    explanation_template = """
-                    Based on the following:
+                    st.success("✅ Query executed successfully!")
+                    st.dataframe(df, use_container_width=True, height=400)
                     
-                    USER QUESTION: {question}
-                    SQL QUERY: {sql_query}
-                    QUERY RESULTS: {results}
-                    
-                    Provide a natural, conversational response explaining the results. 
-                    Be concise but complete. Include key insights from the data.
-                    If the result set is empty, explain why this might be the case.
-                    Format numbers and dates in a human-readable way where appropriate.
-                    """
-                    
-                    results_desc = df.to_markdown() if not df.empty else "No results found."
-                    explanation_prompt = PromptTemplate(
-                        input_variables=["question", "sql_query", "results"],
-                        template=explanation_template
+                    csv = df.to_csv(index=False).encode("utf-8")
+                    st.download_button(
+                        "📥 Download as CSV", 
+                        csv, 
+                        f"query_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", 
+                        "text/csv"
                     )
                     
-                    explanation_chain = LLMChain(llm=llm, prompt=explanation_prompt)
-                    explanation = explanation_chain.run({
-                        "question": question,
-                        "sql_query": sql_query,
-                        "results": results_desc
-                    })
-                    
-                    # Add to chat history
-                    if len(st.session_state.chat_history) >= 20:
-                        st.session_state.chat_history.pop(0)  # Remove oldest exchange
-                    st.session_state.chat_history.append((question, explanation))
-                    
-                    return df, sql_query, explanation
-                    
+                    with st.expander("🔍 View Generated SQL"):
+                        st.code(sql_query, language="sql")
                 except Exception as e:
-                    st.warning(f"⚠️ SQL ran but encountered an error: {e}")
-                    return None, sql_query, f"I couldn't execute that query successfully. Error: {e}"
+                    st.warning(f"⚠️ SQL ran but no data was returned: {e}")
         except Exception as e:
             st.error(f"❌ Error processing your question:\n\n{e}")
-            return None, None, f"I couldn't process your question. Error: {e}"
 
-    # New Integrated UI with Chat and DB Explorer
-    def integrated_ui():
-        # Two-column layout
-        col1, col2 = st.columns([3, 2])
+    # Main UI Layout
+    col1, col2 = st.columns([3, 1])
+
+    with col1:
+        st.header("Database Interaction")
         
-        with col1:
-            st.header("💬 Ask Me About Your Data")
-            
-            # Display chat messages
-            chat_container = st.container()
-            with chat_container:
-                for i, (user_msg, ai_response) in enumerate(st.session_state.chat_history):
-                    st.chat_message("user").write(user_msg)
-                    if ai_response:
-                        st.chat_message("assistant").write(ai_response)
-            
-            # Get user input
-            if user_input := st.chat_input("Ask a question about your data"):
-                st.chat_message("user").write(user_input)
-                
-                db = connect_to_db()
-                
-                # Show a spinner while processing
-                with st.spinner("Analyzing your data..."):
-                    df, sql, explanation = process_question(user_input, db)
-                    
-                    # Display the response
-                    response_container = st.chat_message("assistant")
-                    response_container.write(explanation)
-                    
-                    # Show the dataframe result if available
-                    if df is not None and not df.empty:
-                        with response_container:
-                            st.dataframe(df, use_container_width=True)
-                            
-                            # Add download button
-                            csv = df.to_csv(index=False).encode("utf-8")
-                            st.download_button(
-                                "📥 Download as CSV", 
-                                csv, 
-                                f"query_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", 
-                                "text/csv"
-                            )
-                    
-                    # Show the SQL query in an expander
-                    if sql:
-                        with response_container:
-                            with st.expander("🔍 View SQL Query"):
-                                st.code(sql, language="sql")
+        with st.expander("📤 Upload Data", expanded=True):
+            uploaded_file = st.file_uploader("Upload CSV or Excel file", type=["csv", "xlsx"])
+            if uploaded_file:
+                add_file_to_db(uploaded_file)
         
-        with col2:
-            st.header("📊 Data Explorer")
+        db = connect_to_db()
+        schema_display = format_schema_as_text(db)
+        
+        with st.expander("📊 Database Schema", expanded=True):
+            st.markdown(schema_display or "No tables yet. Upload one above ☝️")
+        
+        with st.expander("📝 Query Input", expanded=True):
+            question = st.text_input(
+                "Type your question here", 
+                placeholder="Type your question about the data"
+            )
             
-            with st.expander("📤 Upload Data", expanded=True):
-                uploaded_file = st.file_uploader("Upload CSV or Excel file", type=["csv", "xlsx"])
-                if uploaded_file:
-                    add_file_to_db(uploaded_file)
-            
-            db = connect_to_db()
-            schema_display = format_schema_as_text(db)
-            
-            with st.expander("📊 Database Schema", expanded=True):
-                st.markdown(schema_display or "No tables yet. Upload one above ☝️")
-            
-            # Table Explorer
-            try:
-                tables = db.get_usable_table_names()
-                if tables:
-                    selected_table = st.selectbox("Select table to preview", sorted(tables))
-                    if selected_table:
-                        # Get table info
-                        conn = sqlite3.connect(DB_PATH)
-                        row_count = pd.read_sql_query(f"SELECT COUNT(*) as count FROM {selected_table}", conn)["count"][0]
-                        st.write(f"Total rows: {row_count}")
-                        
-                        # Preview table
-                        preview_rows = st.slider("Number of rows to preview", 5, 50, 10)
-                        sort_options = ["None"] + list(pd.read_sql_query(f"PRAGMA table_info({selected_table});", conn)["name"])
-                        sort_by = st.selectbox("Sort by", sort_options, index=0)
-                        
-                        # Build query with optional sorting
-                        preview_query = f"SELECT * FROM {selected_table}"
-                        if sort_by != "None":
-                            preview_query += f" ORDER BY {sort_by}"
-                        preview_query += f" LIMIT {preview_rows};"
-                        
-                        # Execute query
-                        preview_df = pd.read_sql_query(preview_query, conn)
-                        st.dataframe(preview_df, use_container_width=True)
-                        
-                        # Example questions section
-                        with st.expander("🤔 Example Questions"):
-                            cols = preview_df.columns.tolist()
-                            if cols:
-                                st.markdown("### Try asking:")
-                                questions = [
-                                    f"How many records are in the {selected_table} table?",
-                                    f"What is the average {cols[0]} in {selected_table}?" if len(cols) > 0 else "",
-                                    f"Show me the records with the highest {cols[0]} in {selected_table}" if len(cols) > 0 else "",
-                                    f"What is the distribution of {cols[0]} in {selected_table}?" if len(cols) > 0 else "",
-                                ]
-                                
-                                for q in questions:
-                                    if q:  # Only add non-empty questions
-                                        st.markdown(f"- *{q}*")
+            if st.button("🔍 Run Query"):
+                if question and question.strip():
+                    process_question(question.strip(), db)
                 else:
-                    st.info("No tables available. Please upload data first.")
-            except Exception as e:
-                st.error(f"Error exploring database: {e}")
+                    st.warning("Please enter a question")
 
-    # Main UI Layout with tabs for different modes
-    tab1, tab2 = st.tabs(["📊 Data Chat & Explorer", "⚙️ Settings"])
-    
-    with tab1:
-        integrated_ui()
-    
-    with tab2:
-        st.header("Settings")
-        
-        # Clear conversation history
-        if st.button("Clear Conversation History"):
-            st.session_state.chat_history = []
-            st.session_state.query_history = []
-            st.success("Conversation history cleared!")
-        
-        # Model settings
-        st.subheader("Model Settings")
-        model_options = {
-            "gpt-4": "GPT-4 (Most capable, slower)",
-            "gpt-3.5-turbo": "GPT-3.5 Turbo (Faster, less capable)"
-        }
-        selected_model = st.selectbox(
-            "Select AI Model",
-            options=list(model_options.keys()),
-            format_func=lambda x: model_options[x],
-            index=0
-        )
-        
-        # Save settings to session state
-        if "model" not in st.session_state or st.session_state.model != selected_model:
-            st.session_state.model = selected_model
-            st.success(f"Model updated to {model_options[selected_model]}")
-        
-        # Database management section
-        st.subheader("Database Management")
-        
-        # Clear database option
-        if st.button("Clear Database", type="secondary"):
-            try:
+    with col2:
+        st.header("Database Preview")
+        try:
+            tables = db.get_usable_table_names()
+            selected_table = st.selectbox("Select table to preview", sorted(tables))
+            if selected_table:
                 conn = sqlite3.connect(DB_PATH)
-                cursor = conn.cursor()
-                # Get all tables
-                cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
-                tables = cursor.fetchall()
-                
-                # Drop all tables
-                for table in tables:
-                    if table[0] != "sqlite_sequence":  # Skip internal SQLite table
-                        cursor.execute(f"DROP TABLE IF EXISTS {table[0]}")
-                
-                conn.commit()
-                conn.close()
-                st.success("Database cleared successfully!")
-            except Exception as e:
-                st.error(f"Error clearing database: {e}")
+                preview_df = pd.read_sql_query(f"SELECT * FROM {selected_table} LIMIT 10;", conn)
+                st.dataframe(preview_df, height=300)
+        except Exception as e:
+            st.warning(f"⚠️ Table preview failed: {e}")
+        
+        st.markdown("---")
+        st.header("🕒 Query History")
+        if st.session_state.query_history:
+            for i, q in enumerate(reversed(st.session_state.query_history[-5:])):
+                st.markdown(f"{len(st.session_state.query_history)-i}. {q[:50]}...")
+            if st.button("Clear History"):
+                st.session_state.query_history = []
+        else:
+            st.info("No queries yet.")
 
     # Add logout button
     st.sidebar.markdown(f"Logged in as: **{st.session_state['username']}**")
