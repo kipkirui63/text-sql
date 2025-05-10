@@ -12,8 +12,6 @@ from dotenv import load_dotenv
 from langchain.memory import ConversationBufferMemory
 from langchain.chains import ConversationalRetrievalChain
 from langchain_community.chat_message_histories import StreamlitChatMessageHistory
-from fuzzywuzzy import fuzz
-import re
 
 # Load environment variables
 load_dotenv()
@@ -70,20 +68,6 @@ def verify_user(username, password):
     if result:
         return result[0] == hash_password(password)
     return False
-
-# Helper function for fuzzy column matching
-def find_closest_column(target_col, table_info):
-    best_match = None
-    best_score = 0
-    
-    for table, info in table_info.items():
-        for col in info['schema']['name']:
-            score = fuzz.ratio(target_col.lower(), col.lower())
-            if score > best_score:
-                best_score = score
-                best_match = col
-                
-    return best_match, best_score
 
 # Authentication UI
 def auth_page():
@@ -218,40 +202,29 @@ def main_app():
         table_info = {}
         for table in db.get_usable_table_names():
             conn = sqlite3.connect(DB_PATH)
-            try:
-                # Get schema
-                schema = pd.read_sql_query(f"PRAGMA table_info({table});", conn)
-                # Get row count
-                row_count = pd.read_sql_query(f"SELECT COUNT(*) as count FROM {table}", conn)["count"][0]
-                # Get sample data
-                sample = pd.read_sql_query(f"SELECT * FROM {table} LIMIT 5", conn)
-                
-                table_info[table] = {
-                    "schema": schema,
-                    "row_count": row_count,
-                    "sample": sample
-                }
-            except Exception as e:
-                st.error(f"Error getting info for table {table}: {e}")
-            finally:
-                conn.close()
+            # Get schema
+            schema = pd.read_sql_query(f"PRAGMA table_info({table});", conn)
+            # Get row count
+            row_count = pd.read_sql_query(f"SELECT COUNT(*) as count FROM {table}", conn)["count"][0]
+            # Get sample data
+            sample = get_sample_data(table)
+            
+            table_info[table] = {
+                "schema": schema,
+                "row_count": row_count,
+                "sample": sample
+            }
+            conn.close()
         return table_info
 
     def process_question(question, db, with_context=True):
         """Process the user question and execute SQL query with context awareness"""
         schema_text = get_all_schemas(db)
-        table_info = get_table_info(db)
         
-        # Template for SQL generation with improved instructions
+        # Template for SQL generation
         sql_template = """
         You are a SQL expert. Based on the database schema and the user's question, 
         write a correct SQLite SQL query. Use only the tables and columns provided.
-        
-        Important Guidelines:
-        1. Always verify table and column names exist in the schema
-        2. If a column name isn't exact, use the closest match
-        3. For date/time queries, use proper SQLite date functions
-        4. Never generate DELETE, DROP, or other destructive commands
         
         Schema:
         {schema}
@@ -261,13 +234,7 @@ def main_app():
         User Question:
         {question}
         
-        First, analyze the question and identify:
-        - Which tables are needed
-        - Which columns are needed
-        - Any filtering conditions
-        - Any sorting requirements
-        
-        Then generate the SQL Query (ONLY return the SQL query without any explanation or markdown):
+        SQL Query (ONLY return the SQL query without any explanation or markdown):
         """
         
         # Add context from conversation history if available
@@ -300,75 +267,52 @@ def main_app():
                 sql_query = sql_query.split("```")[0]
             sql_query = sql_query.strip()
             
-            # Safety check
             forbidden = ["drop", "delete", "update", "insert", "alter", "truncate"]
             if any(f in sql_query.lower() for f in forbidden):
                 st.error("❌ Unsafe SQL command detected.")
-                return None, None, "I can't execute that query for security reasons."
-            
-            # Try to execute the query
-            try:
-                conn = sqlite3.connect(DB_PATH)
-                df = pd.read_sql_query(sql_query, conn)
-                
-                # Generate a natural language explanation of the result
-                explanation_template = """
-                Based on the following:
-                
-                USER QUESTION: {question}
-                SQL QUERY: {sql_query}
-                QUERY RESULTS: {results}
-                
-                Provide a natural, conversational response explaining the results. 
-                Be concise but complete. Include key insights from the data.
-                If the result set is empty, explain why this might be the case.
-                Format numbers and dates in a human-readable way where appropriate.
-                """
-                
-                results_desc = df.to_markdown() if not df.empty else "No results found."
-                explanation_prompt = PromptTemplate(
-                    input_variables=["question", "sql_query", "results"],
-                    template=explanation_template
-                )
-                
-                explanation_chain = LLMChain(llm=llm, prompt=explanation_prompt)
-                explanation = explanation_chain.run({
-                    "question": question,
-                    "sql_query": sql_query,
-                    "results": results_desc
-                })
-                
-                # Add to chat history
-                if len(st.session_state.chat_history) >= 20:
-                    st.session_state.chat_history.pop(0)  # Remove oldest exchange
-                st.session_state.chat_history.append((question, explanation))
-                
-                return df, sql_query, explanation
-                
-            except sqlite3.OperationalError as e:
-                # Handle column/tablename errors with fuzzy matching
-                error_msg = str(e)
-                column_error = re.search(r"no such column: (\w+)", error_msg)
-                table_error = re.search(r"no such table: (\w+)", error_msg)
-                
-                if column_error:
-                    missing_col = column_error.group(1)
-                    # Find closest column match in the schema
-                    best_match, best_score = find_closest_column(missing_col, table_info)
-                    if best_score > 70:  # Good enough match
-                        corrected_query = sql_query.replace(missing_col, best_match)
-                        try:
-                            df = pd.read_sql_query(corrected_query, conn)
-                            explanation = f"I assumed you meant '{best_match}' when you said '{missing_col}'. Here are the results:"
-                            return df, corrected_query, explanation
-                        except Exception as e2:
-                            return None, sql_query, f"I couldn't execute that query. Error: {e2}"
-                
-                return None, sql_query, f"I couldn't execute that query. Error: {e}"
-                
-            except Exception as e:
-                st.warning(f"⚠️ SQL ran but encountered an error: {e}")
-                return None, sql_query, f"I couldn't execute that query successfully. Error: {e}"
+                return None, None
+            else:
+                try:
+                    conn = sqlite3.connect(DB_PATH)
+                    df = pd.read_sql_query(sql_query, conn)
+                    
+                    # Generate a natural language explanation of the result
+                    explanation_template = """
+                    Based on the following:
+                    
+                    USER QUESTION: {question}
+                    SQL QUERY: {sql_query}
+                    QUERY RESULTS: {results}
+                    
+                    Provide a natural, conversational response explaining the results. 
+                    Be concise but complete. Include key insights from the data.
+                    If the result set is empty, explain why this might be the case.
+                    Format numbers and dates in a human-readable way where appropriate.
+                    """
+                    
+                    results_desc = df.to_markdown() if not df.empty else "No results found."
+                    explanation_prompt = PromptTemplate(
+                        input_variables=["question", "sql_query", "results"],
+                        template=explanation_template
+                    )
+                    
+                    explanation_chain = LLMChain(llm=llm, prompt=explanation_prompt)
+                    explanation = explanation_chain.run({
+                        "question": question,
+                        "sql_query": sql_query,
+                        "results": results_desc
+                    })
+                    
+                    # Add to chat history
+                    if len(st.session_state.chat_history) >= 20:
+                        st.session_state.chat_history.pop(0)  # Remove oldest exchange
+                    st.session_state.chat_history.append((question, explanation))
+                    
+                    return df, sql_query, explanation
+                    
+                except Exception as e:
+                    st.warning(f"⚠️ SQL ran but encountered an error: {e}")
+                    return None, sql_query, f"I couldn't execute that query successfully. Error: {e}"
         except Exception as e:
             st.error(f"❌ Error processing your question:\n\n{e}")
             return None, None, f"I couldn't process your question. Error: {e}"
