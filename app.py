@@ -642,8 +642,8 @@ def main_app():
         
         # Natural language query interface
         st.markdown('<div class="query-box">', unsafe_allow_html=True)
-        st.markdown("### 💬 Ask in Plain English")
-        st.markdown("Ask questions about your data in natural language. You don't need to specify table names - just ask your question!")
+        st.markdown("### 💬 Ask ")
+        st.markdown("")
         
         table_descriptions = get_table_description(db)
         if table_descriptions:
@@ -653,11 +653,7 @@ def main_app():
             else:
                 st.markdown(f"You have {len(table_descriptions)} datasets available.")
         
-        st.markdown("**Examples you can try:**")
-        st.markdown("- What's the total for each category?")
-        st.markdown("- Show me the top 5 highest values")
-        st.markdown("- What's the average by month?")
-        st.markdown("- How many records do I have?")
+        
         
         question = st.text_area(
             "Type your question here", 
