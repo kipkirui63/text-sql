@@ -498,9 +498,21 @@ def main_app():
     def process_question(question, db):
         """Process user question and execute SQL query"""
         schema_text = get_all_schemas(db)
+        user_tables = get_user_tables(username)
+        
+        # Get the list of tables with their original names for better context
+        table_context = "\n".join([f"Table '{original_file}' is stored as '{table_name}'" 
+                                  for table_name, original_file in user_tables])
+        
+        # For single table scenarios, we can be extra helpful
+        if len(user_tables) == 1:
+            table_name, original_file = user_tables[0]
+            hint = f"Note: The user has only one table from file '{original_file}'. You should query the table '{table_name}' even if the user doesn't specify it."
+        else:
+            hint = "Use the most relevant table(s) based on the question. If unclear which table to use, select the most appropriate one based on column names and context."
         
         prompt = PromptTemplate(
-            input_variables=["schema", "question"],
+            input_variables=["schema", "question", "table_context", "hint"],
             template="""
             You are a SQL expert. Based on the database schema and the user's question, 
             write a correct SQLite SQL query. Use only the tables and columns provided.
@@ -508,6 +520,11 @@ def main_app():
 
             Schema:
             {schema}
+            
+            Table Information:
+            {table_context}
+            
+            {hint}
 
             User Question:
             {question}
@@ -521,7 +538,12 @@ def main_app():
         
         try:
             st.session_state.query_history.append(question)
-            sql_query = chain.run({"schema": schema_text, "question": question})
+            sql_query = chain.run({
+                "schema": schema_text, 
+                "question": question,
+                "table_context": table_context,
+                "hint": hint
+            })
 
             # Sanitize the SQL query
             forbidden = ["drop", "delete", "update", "insert", "alter", "truncate"]
@@ -530,14 +552,17 @@ def main_app():
             else:
                 try:
                     # Ensure query only accesses the user's tables
-                    user_tables = [table for table, _ in get_user_tables(username)]
+                    allowed_tables = [table for table, _ in user_tables]
                     
                     # Extract table names from the query (simplified approach)
                     tables_in_query = re.findall(r'from\s+([^\s,;]+)', sql_query.lower())
                     tables_in_query += re.findall(r'join\s+([^\s,;]+)', sql_query.lower())
                     
+                    # Remove SQL aliases from table names
+                    tables_in_query = [table.strip().split(' ')[0] for table in tables_in_query]
+                    
                     # Check if query only accesses user's tables
-                    if all(table.strip() in user_tables for table in tables_in_query):
+                    if all(table.strip() in allowed_tables for table in tables_in_query):
                         conn = sqlite3.connect(DB_PATH)
                         df = pd.read_sql_query(sql_query, conn)
                         
@@ -618,10 +643,21 @@ def main_app():
         # Natural language query interface
         st.markdown('<div class="query-box">', unsafe_allow_html=True)
         st.markdown("### 💬 Ask in Plain English")
-        st.markdown("Ask questions about your data in natural language. Examples:")
-        st.markdown("- What's the total revenue for each product category?")
-        st.markdown("- How many customers do we have in each state?")
-        st.markdown("- What were our top 5 selling products last month?")
+        st.markdown("Ask questions about your data in natural language. You don't need to specify table names - just ask your question!")
+        
+        table_descriptions = get_table_description(db)
+        if table_descriptions:
+            if len(table_descriptions) == 1:
+                table = table_descriptions[0]
+                st.markdown(f"Your data from **{table['original_file']}** has columns: **{', '.join(table['columns'][:5])}**{' and more...' if len(table['columns']) > 5 else ''}")
+            else:
+                st.markdown(f"You have {len(table_descriptions)} datasets available.")
+        
+        st.markdown("**Examples you can try:**")
+        st.markdown("- What's the total for each category?")
+        st.markdown("- Show me the top 5 highest values")
+        st.markdown("- What's the average by month?")
+        st.markdown("- How many records do I have?")
         
         question = st.text_area(
             "Type your question here", 
@@ -674,9 +710,10 @@ def main_app():
         with st.expander("📝 Making Good Queries"):
             st.markdown("""
             - Be specific about what you want to know
-            - Mention table names if you have multiple tables
-            - For time-based queries, specify the period
-            - For comparisons, make clear what you're comparing
+            - Focus on the data fields you're interested in
+            - For time-based queries, specify the period (e.g., "last month")
+            - For comparisons, make clear what you're comparing (e.g., "compare sales by region")
+            - You don't need to specify table names - the system will figure it out!
             """)
             
         with st.expander("🛠️ Supported Data Types"):
