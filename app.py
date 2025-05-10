@@ -7,6 +7,9 @@ from langchain_openai import ChatOpenAI
 from langchain.chains import LLMChain
 from langchain_community.utilities.sql_database import SQLDatabase
 from datetime import datetime
+from dotenv import load_dotenv
+# Set page config
+load_dotenv()
 
 # Set page config
 st.set_page_config(page_title="SQL Query Agent", layout="wide", page_icon="🔍")
@@ -17,11 +20,19 @@ if "query_history" not in st.session_state:
     st.session_state.query_history = []
 
 # Environment setup
-openai.api_key = os.getenv("OPENAI_API_KEY")
+try:
+    openai_api_key = os.getenv("OPENAI_API_KEY")
+    if not openai_api_key:
+        st.error("OpenAI API key not found. Please set OPENAI_API_KEY environment variable.")
+        st.stop()
+except Exception as e:
+    st.error(f"Error loading environment variables: {e}")
+    st.stop()
+
 DB_PATH = "my_database.db"
 
 # Database functions
-@st.cache_data
+@st.cache_resource
 def connect_to_db():
     try:
         return SQLDatabase.from_uri(f"sqlite:///{DB_PATH}")
