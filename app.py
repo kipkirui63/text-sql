@@ -12,7 +12,7 @@ from datetime import datetime
 
 # Set page config
 st.set_page_config(page_title="SQL Agent", layout="wide", page_icon="🗣️")
-st.title("SQL Query Agent")
+st.title("Text to SQL Query Agent")
 
 # Initialize session state
 if "query_history" not in st.session_state:
