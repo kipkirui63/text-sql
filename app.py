@@ -9,7 +9,14 @@ from langchain_community.utilities.sql_database import SQLDatabase
 from datetime import datetime
 import hashlib
 import re
+import logging
 from dotenv import load_dotenv
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, 
+                   format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+                   handlers=[logging.StreamHandler()])
+logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
@@ -166,38 +173,69 @@ st.markdown("""
 # =============================================
 # DATABASE FUNCTIONS
 # =============================================
+@st.cache_resource
+def get_db_connection(db_path='user_db.db'):
+    """Get a database connection from the connection pool"""
+    try:
+        conn = sqlite3.connect(db_path)
+        return conn
+    except Exception as e:
+        logger.error(f"Error connecting to database: {e}")
+        st.error(f"Failed to connect to database: {str(e)}")
+        return None
+
 def init_db():
     """Initialize the user database"""
-    conn = sqlite3.connect('user_db.db')
-    c = conn.cursor()
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            username TEXT PRIMARY KEY,
-            password TEXT NOT NULL,
-            email TEXT,
-            full_name TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    # Create a table to track user-table associations
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS user_tables (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT,
-            table_name TEXT,
-            original_filename TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (username) REFERENCES users(username),
-            UNIQUE(username, table_name)
-        )
-    ''')
-    
-    conn.commit()
-    conn.close()
+    try:
+        # Ensure data directories exist
+        os.makedirs("user_data", exist_ok=True)
+        
+        conn = get_db_connection()
+        if conn is None:
+            return False
+            
+        c = conn.cursor()
+        
+        # Set journal mode for better concurrency
+        c.execute("PRAGMA journal_mode=WAL;")
+        
+        # Create users table if it doesn't exist
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                username TEXT PRIMARY KEY,
+                password TEXT NOT NULL,
+                email TEXT,
+                full_name TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Create user_tables table if it doesn't exist
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS user_tables (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT,
+                table_name TEXT,
+                original_filename TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (username) REFERENCES users(username),
+                UNIQUE(username, table_name)
+            )
+        ''')
+        
+        conn.commit()
+        conn.close()
+        logger.info("Database initialized successfully")
+        return True
+    except Exception as e:
+        logger.error(f"Database initialization error: {e}")
+        st.error(f"Database initialization error: {str(e)}")
+        return False
 
-# Initialize databases
-init_db()
+# Initialize databases when the app starts
+if not init_db():
+    st.error("Failed to initialize database. Please check logs for details.")
+    st.stop()
 
 # =============================================
 # SECURITY FUNCTIONS
@@ -228,73 +266,117 @@ def is_valid_password(password):
 # =============================================
 def create_user(username, password, email=None, full_name=None):
     """Create a new user account"""
-    conn = sqlite3.connect('user_db.db')
-    c = conn.cursor()
     try:
+        conn = get_db_connection()
+        if conn is None:
+            return False, "Database connection error"
+            
+        c = conn.cursor()
+        
+        # Check if user already exists
+        c.execute("SELECT username FROM users WHERE username = ?", (username,))
+        if c.fetchone():
+            conn.close()
+            return False, "Username already exists"
+        
+        # Insert new user
         c.execute(
             "INSERT INTO users (username, password, email, full_name) VALUES (?, ?, ?, ?)",
             (username, hash_password(password), email, full_name)
         )
         conn.commit()
+        conn.close()
+        
+        # Create user database file
+        user_db_path = get_user_db_path(username)
+        user_conn = sqlite3.connect(user_db_path)
+        user_conn.close()
+        
+        logger.info(f"User created successfully: {username}")
         return True, "Account created successfully!"
     except sqlite3.IntegrityError:
+        logger.error(f"IntegrityError creating user: {username}")
         return False, "Username already exists"
-    finally:
-        conn.close()
+    except sqlite3.Error as e:
+        logger.error(f"SQLite error creating user: {e}")
+        return False, f"Database error: {str(e)}"
+    except Exception as e:
+        logger.error(f"Error creating user: {e}")
+        return False, f"Error creating account: {str(e)}"
 
 def verify_user(username, password):
     """Verify user credentials"""
-    conn = sqlite3.connect('user_db.db')
-    c = conn.cursor()
-    c.execute(
-        "SELECT password FROM users WHERE username = ?",
-        (username,)
-    )
-    result = c.fetchone()
-    conn.close()
-    if result:
-        return result[0] == hash_password(password)
-    return False
+    try:
+        conn = get_db_connection()
+        if conn is None:
+            return False
+            
+        c = conn.cursor()
+        c.execute(
+            "SELECT password FROM users WHERE username = ?",
+            (username,)
+        )
+        result = c.fetchone()
+        conn.close()
+        
+        if result:
+            return result[0] == hash_password(password)
+        return False
+    except Exception as e:
+        logger.error(f"Error verifying user: {e}")
+        return False
 
 # =============================================
 # USER DATA MANAGEMENT
 # =============================================
 def get_user_tables(username):
     """Get all tables associated with the user"""
-    conn = sqlite3.connect('user_db.db')
-    c = conn.cursor()
-    c.execute(
-        "SELECT table_name, original_filename FROM user_tables WHERE username = ?",
-        (username,)
-    )
-    results = c.fetchall()
-    conn.close()
-    return results
+    try:
+        conn = get_db_connection()
+        if conn is None:
+            return []
+            
+        c = conn.cursor()
+        c.execute(
+            "SELECT table_name, original_filename FROM user_tables WHERE username = ?",
+            (username,)
+        )
+        results = c.fetchall()
+        conn.close()
+        return results
+    except Exception as e:
+        logger.error(f"Error getting user tables: {e}")
+        return []
 
 def add_user_table(username, table_name, original_filename):
     """Record a table as belonging to a specific user"""
-    conn = sqlite3.connect('user_db.db')
-    c = conn.cursor()
     try:
-        c.execute(
-            "INSERT INTO user_tables (username, table_name, original_filename) VALUES (?, ?, ?)",
-            (username, table_name, original_filename)
-        )
-        conn.commit()
-        return True
-    except sqlite3.IntegrityError:
-        # Update the entry if it already exists
-        c.execute(
-            "UPDATE user_tables SET original_filename = ? WHERE username = ? AND table_name = ?",
-            (original_filename, username, table_name)
-        )
-        conn.commit()
-        return True
+        conn = get_db_connection()
+        if conn is None:
+            return False
+            
+        c = conn.cursor()
+        try:
+            c.execute(
+                "INSERT INTO user_tables (username, table_name, original_filename) VALUES (?, ?, ?)",
+                (username, table_name, original_filename)
+            )
+            conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            # Update the entry if it already exists
+            c.execute(
+                "UPDATE user_tables SET original_filename = ? WHERE username = ? AND table_name = ?",
+                (original_filename, username, table_name)
+            )
+            conn.commit()
+            return True
     except Exception as e:
-        print(f"Error adding user table: {e}")
+        logger.error(f"Error adding user table: {e}")
         return False
     finally:
-        conn.close()
+        if conn:
+            conn.close()
 
 def get_user_db_path(username):
     """Get the user-specific database path"""
@@ -358,26 +440,31 @@ def auth_page():
                     unsafe_allow_html=True
                 )
                 
-                if st.form_submit_button("Sign Up", type="primary", use_container_width=True):
-                    if not all([full_name, email, username, password, confirm_password]):
-                        st.error("Please fill in all fields")
-                    elif not is_valid_email(email):
-                        st.error("Please enter a valid email address")
-                    else:
-                        valid_pass, pass_msg = is_valid_password(password)
-                        if not valid_pass:
-                            st.error(pass_msg)
-                        elif password != confirm_password:
-                            st.error("Passwords don't match")
+                submit_button = st.form_submit_button("Sign Up", type="primary", use_container_width=True)
+                if submit_button:
+                    try:
+                        if not all([full_name, email, username, password, confirm_password]):
+                            st.error("Please fill in all fields")
+                        elif not is_valid_email(email):
+                            st.error("Please enter a valid email address")
                         else:
-                            success, message = create_user(username, password, email, full_name)
-                            if success:
-                                st.success(message)
-                                st.session_state["authenticated"] = True
-                                st.session_state["username"] = username
-                                st.rerun()
+                            valid_pass, pass_msg = is_valid_password(password)
+                            if not valid_pass:
+                                st.error(pass_msg)
+                            elif password != confirm_password:
+                                st.error("Passwords don't match")
                             else:
-                                st.error(message)
+                                success, message = create_user(username, password, email, full_name)
+                                if success:
+                                    st.success(message)
+                                    st.session_state["authenticated"] = True
+                                    st.session_state["username"] = username
+                                    st.rerun()
+                                else:
+                                    st.error(message)
+                    except Exception as e:
+                        logger.error(f"Error during signup: {e}")
+                        st.error(f"An unexpected error occurred. Please try again.")
             
             st.markdown(
                 '<p class="auth-message">Already have an account? <span class="auth-link" onclick="switchTab()">Login here</span></p>', 
@@ -418,6 +505,7 @@ def main_app():
             st.error("OpenAI API key not found. Please set OPENAI_API_KEY environment variable.")
             st.stop()
     except Exception as e:
+        logger.error(f"Error loading environment variables: {e}")
         st.error(f"Error loading environment variables: {e}")
         st.stop()
 
@@ -431,20 +519,26 @@ def main_app():
         try:
             return SQLDatabase.from_uri(f"sqlite:///{db_path}")
         except Exception as e:
+            logger.error(f"Failed to connect to database: {e}")
             st.error(f"Failed to connect to database: {e}")
-            st.stop()
+            return None
 
     def get_all_schemas(db) -> str:
         """Get all table schemas as formatted string"""
         schema_str = ""
-        for table in db.get_usable_table_names():
-            try:
-                columns = db.run(f"PRAGMA table_info({table})")
-                col_lines = [f"{col['name']} ({col['type']})" for col in columns]
-                schema_str += f"Table: {table}\nColumns: {', '.join(col_lines)}\n\n"
-            except:
-                continue
-        return schema_str.strip()
+        try:
+            for table in db.get_usable_table_names():
+                try:
+                    columns = db.run(f"PRAGMA table_info({table})")
+                    col_lines = [f"{col['name']} ({col['type']})" for col in columns]
+                    schema_str += f"Table: {table}\nColumns: {', '.join(col_lines)}\n\n"
+                except Exception as e:
+                    logger.warning(f"Error getting schema for table {table}: {e}")
+                    continue
+            return schema_str.strip()
+        except Exception as e:
+            logger.error(f"Error getting schemas: {e}")
+            return ""
 
     def format_schema_as_text(db) -> str:
         """Format schema for display"""
@@ -458,9 +552,10 @@ def main_app():
                 for i, row in df.iterrows():
                     output += f"- `{row['name']}` ({row['type']})\n"
                 output += "\n"
+            conn.close()
             return output
         except Exception as e:
-            st.error(f"Error loading schema: {e}")
+            logger.error(f"Error loading schema: {e}")
             return ""
 
     def add_file_to_db(uploaded_file):
@@ -490,56 +585,86 @@ def main_app():
             # Record the table association in the user_tables
             if add_user_table(username, table_name, file_name):
                 st.success(f"✅ '{file_name}' added successfully")
+                logger.info(f"File uploaded successfully: {file_name} for user {username}")
             else:
                 st.warning("⚠️ File added but failed to record table association")
+                logger.warning(f"Failed to record table association for {file_name}")
         except Exception as e:
+            logger.error(f"Failed to add file: {e}")
             st.error(f"❌ Failed to add file: {e}")
 
     def process_question(question, db):
         """Process user question and execute SQL query"""
-        schema_text = get_all_schemas(db)
-        
-        prompt = PromptTemplate(
-            input_variables=["schema", "question"],
-            template="""
-            You are a SQL expert. Based on the database schema and the user's question, 
-            write a correct SQLite SQL query. Use only the tables and columns provided.
-            Your goal is to translate natural language questions to accurate SQL queries.
-
-            Schema:
-            {schema}
-
-            User Question:
-            {question}
-
-            SQL Query:
-            """
-        )
-        
-        llm = ChatOpenAI(temperature=0, model_name="gpt-4", openai_api_key=openai_api_key)
-        chain = LLMChain(llm=llm, prompt=prompt)
-        
         try:
+            schema_text = get_all_schemas(db)
+            user_tables = get_user_tables(username)
+            
+            # Get the list of tables with their original names for better context
+            table_context = "\n".join([f"Table '{original_file}' is stored as '{table_name}'" 
+                                    for table_name, original_file in user_tables])
+            
+            # For single table scenarios, we can be extra helpful
+            if len(user_tables) == 1:
+                table_name, original_file = user_tables[0]
+                hint = f"Note: The user has only one table from file '{original_file}'. You should query the table '{table_name}' even if the user doesn't specify it."
+            else:
+                hint = "Use the most relevant table(s) based on the question. If unclear which table to use, select the most appropriate one based on column names and context."
+            
+            prompt = PromptTemplate(
+                input_variables=["schema", "question", "table_context", "hint"],
+                template="""
+                You are a SQL expert. Based on the database schema and the user's question, 
+                write a correct SQLite SQL query. Use only the tables and columns provided.
+                Your goal is to translate natural language questions to accurate SQL queries.
+
+                Schema:
+                {schema}
+                
+                Table Information:
+                {table_context}
+                
+                {hint}
+
+                User Question:
+                {question}
+
+                SQL Query:
+                """
+            )
+            
+            llm = ChatOpenAI(temperature=0, model_name="gpt-4", openai_api_key=openai_api_key)
+            chain = LLMChain(llm=llm, prompt=prompt)
+            
             st.session_state.query_history.append(question)
-            sql_query = chain.run({"schema": schema_text, "question": question})
+            sql_query = chain.run({
+                "schema": schema_text, 
+                "question": question,
+                "table_context": table_context,
+                "hint": hint
+            })
 
             # Sanitize the SQL query
             forbidden = ["drop", "delete", "update", "insert", "alter", "truncate"]
             if any(f in sql_query.lower() for f in forbidden):
                 st.error("❌ Unsafe SQL command detected.")
+                logger.warning(f"Unsafe SQL command detected: {sql_query}")
             else:
                 try:
                     # Ensure query only accesses the user's tables
-                    user_tables = [table for table, _ in get_user_tables(username)]
+                    allowed_tables = [table for table, _ in user_tables]
                     
                     # Extract table names from the query (simplified approach)
                     tables_in_query = re.findall(r'from\s+([^\s,;]+)', sql_query.lower())
                     tables_in_query += re.findall(r'join\s+([^\s,;]+)', sql_query.lower())
                     
+                    # Remove SQL aliases from table names
+                    tables_in_query = [table.strip().split(' ')[0] for table in tables_in_query]
+                    
                     # Check if query only accesses user's tables
-                    if all(table.strip() in user_tables for table in tables_in_query):
+                    if all(table.strip() in allowed_tables for table in tables_in_query):
                         conn = sqlite3.connect(DB_PATH)
                         df = pd.read_sql_query(sql_query, conn)
+                        conn.close()
                         
                         st.success("✅ Query executed successfully!")
                         st.dataframe(df, use_container_width=True, height=400)
@@ -554,11 +679,16 @@ def main_app():
                         
                         with st.expander("🔍 View Generated SQL"):
                             st.code(sql_query, language="sql")
+                            
+                        logger.info(f"Query executed successfully for user {username}")
                     else:
                         st.error("❌ The query attempts to access tables you don't have permission for.")
+                        logger.warning(f"Unauthorized table access attempt in query: {sql_query}")
                 except Exception as e:
+                    logger.error(f"Error executing SQL: {e}")
                     st.warning(f"⚠️ SQL ran but no data was returned: {e}")
         except Exception as e:
+            logger.error(f"Error processing question: {e}")
             st.error(f"❌ Error processing your question:\n\n{e}")
             
     def get_table_description(db):
@@ -568,25 +698,30 @@ def main_app():
             descriptions = []
             
             for table_name, original_file in user_tables:
-                conn = sqlite3.connect(DB_PATH)
-                
-                # Get row count
-                row_count = pd.read_sql_query(f"SELECT COUNT(*) as count FROM {table_name}", conn).iloc[0]['count']
-                
-                # Get column names and sample data
-                df = pd.read_sql_query(f"SELECT * FROM {table_name} LIMIT 3", conn)
-                columns = df.columns.tolist()
-                
-                descriptions.append({
-                    "table_name": table_name,
-                    "original_file": original_file,
-                    "row_count": row_count,
-                    "columns": columns,
-                })
+                try:
+                    conn = sqlite3.connect(DB_PATH)
+                    
+                    # Get row count
+                    row_count = pd.read_sql_query(f"SELECT COUNT(*) as count FROM {table_name}", conn).iloc[0]['count']
+                    
+                    # Get column names and sample data
+                    df = pd.read_sql_query(f"SELECT * FROM {table_name} LIMIT 3", conn)
+                    columns = df.columns.tolist()
+                    conn.close()
+                    
+                    descriptions.append({
+                        "table_name": table_name,
+                        "original_file": original_file,
+                        "row_count": row_count,
+                        "columns": columns,
+                    })
+                except Exception as e:
+                    logger.error(f"Error getting description for table {table_name}: {e}")
+                    continue
                 
             return descriptions
         except Exception as e:
-            st.error(f"Error getting table description: {e}")
+            logger.error(f"Error getting table description: {e}")
             return []
 
     # =============================================
@@ -614,48 +749,59 @@ def main_app():
                 add_file_to_db(uploaded_file)
         
         db = connect_to_db(DB_PATH)
-        
-        # Natural language query interface
-        st.markdown('<div class="query-box">', unsafe_allow_html=True)
-        st.markdown("### 💬 Ask in Plain English")
-        st.markdown("Ask questions about your data in natural language. Examples:")
-        st.markdown("- What's the total revenue for each product category?")
-        st.markdown("- How many customers do we have in each state?")
-        st.markdown("- What were our top 5 selling products last month?")
-        
-        question = st.text_area(
-            "Type your question here", 
-            placeholder="Type your question about the data",
-            height=80
-        )
-        
-        if st.button("🔍 Get Answer", use_container_width=True):
-            if question and question.strip():
-                # Check if user has any tables first
-                user_tables = get_user_tables(username)
-                if not user_tables:
-                    st.warning("⚠️ You don't have any data uploaded yet. Please upload a CSV or Excel file first.")
-                else:
-                    process_question(question.strip(), db)
-            else:
-                st.warning("Please enter a question")
-        st.markdown('</div>', unsafe_allow_html=True)
-        
-        # Display user's tables
-        table_descriptions = get_table_description(db)
-        if table_descriptions:
-            st.header("Your Available Data")
-            for i, table in enumerate(table_descriptions):
-                with st.expander(f"📄 {table['original_file']} ({table['row_count']} rows)"):
-                    st.write(f"**Table name**: {table['table_name']}")
-                    st.write(f"**Columns**: {', '.join(table['columns'])}")
-                    
-                    # Show sample data
-                    conn = sqlite3.connect(DB_PATH)
-                    sample_df = pd.read_sql_query(f"SELECT * FROM {table['table_name']} LIMIT 5", conn)
-                    st.dataframe(sample_df, use_container_width=True)
+        if db is None:
+            st.error("Failed to connect to your database. Please try logging out and back in.")
         else:
-            st.info("👆 You don't have any data yet. Please upload a file above.")
+            # Natural language query interface
+            st.markdown('<div class="query-box">', unsafe_allow_html=True)
+            st.markdown("### 💬 Ask ")
+            st.markdown("")
+            
+            table_descriptions = get_table_description(db)
+            if table_descriptions:
+                if len(table_descriptions) == 1:
+                    table = table_descriptions[0]
+                    st.markdown(f"Your data from **{table['original_file']}** has columns: **{', '.join(table['columns'][:5])}**{' and more...' if len(table['columns']) > 5 else ''}")
+                else:
+                    st.markdown(f"You have {len(table_descriptions)} datasets available.")
+            
+            question = st.text_area(
+                "Type your question here", 
+                placeholder="Type your question about the data",
+                height=80
+            )
+            
+            if st.button("🔍 Get Answer", use_container_width=True):
+                if question and question.strip():
+                    # Check if user has any tables first
+                    user_tables = get_user_tables(username)
+                    if not user_tables:
+                        st.warning("⚠️ You don't have any data uploaded yet. Please upload a CSV or Excel file first.")
+                    else:
+                        process_question(question.strip(), db)
+                else:
+                    st.warning("Please enter a question")
+            st.markdown('</div>', unsafe_allow_html=True)
+            
+            # Display user's tables
+            table_descriptions = get_table_description(db)
+            if table_descriptions:
+                st.header("Your Available Data")
+                for i, table in enumerate(table_descriptions):
+                    with st.expander(f"📄 {table['original_file']} ({table['row_count']} rows)"):
+                        st.write(f"**Table name**: {table['table_name']}")
+                        st.write(f"**Columns**: {', '.join(table['columns'])}")
+                        
+                        try:
+                            # Show sample data
+                            conn = sqlite3.connect(DB_PATH)
+                            sample_df = pd.read_sql_query(f"SELECT * FROM {table['table_name']} LIMIT 5", conn)
+                            conn.close()
+                            st.dataframe(sample_df, use_container_width=True)
+                        except Exception as e:
+                            st.error(f"Error loading sample data: {e}")
+            else:
+                st.info("👆 You don't have any data yet. Please upload a file above.")
 
     with col2:
         st.header("Query History")
@@ -674,7 +820,7 @@ def main_app():
         with st.expander("📝 Making Good Queries"):
             st.markdown("""
             - Be specific about what you want to know
-            - Mention table names if you have multiple tables
+            - Focus on the
             - For time-based queries, specify the period
             - For comparisons, make clear what you're comparing
             """)
